@@ -1,0 +1,63 @@
+# /home/p4b/civitas-goat-addon/tasks/01_db.yml
+---
+# Patch the civitas central-db Cluster CR to add a `goat` prepared database.
+# The Zalando postgres-operator's `preparedDatabases.defaultUsers: true`
+# auto-creates:
+#   - goat_owner, goat_reader, goat_writer PostgreSQL users
+#   - K8s Secrets named goat-owner-user.<cluster>.credentials.postgresql.acid.zalan.do
+#                       goat-reader-user.<cluster>...
+#                       goat-writer-user.<cluster>...
+
+- name: Build goat preparedDatabases patch
+  # Ansible does NOT evaluate Jinja2 expressions inside YAML dict KEYS.
+  # Building the dict as a single Jinja2 expression where the key is a
+  # variable reference is the workaround that actually works.
+  ansible.builtin.set_fact:
+    goat_prepared_db_patch: >-
+      {{ {goat_addon.db.name: {
+          'defaultUsers': true,
+          'extensions': {'postgis': 'public', 'postgis_topology': 'topology'}
+        }} }}
+
+- name: Patch civitas central-db with goat prepared database
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    apply: true
+    definition:
+      apiVersion: acid.zalan.do/v1
+      kind: postgresql
+      metadata:
+        name: "{{ goat_addon.db.central_db_name }}"
+      spec:
+        preparedDatabases: "{{ goat_prepared_db_patch }}"
+
+- name: Wait for goat owner-user secret to be created by postgres-operator
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    name: "{{ goat_addon.db.name }}-owner-user.{{ goat_addon.db.central_db_name }}.credentials.postgresql.acid.zalan.do"
+  register: goat_db_secret
+  retries: 30
+  delay: 5
+  until: goat_db_secret.resources | length > 0
+
+- name: Copy goat owner-user secret into the goat namespace
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: goat-postgres-creds
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      type: Opaque
+      data:
+        username: "{{ goat_db_secret.resources[0].data.username }}"
+        password: "{{ goat_db_secret.resources[0].data.password }}"

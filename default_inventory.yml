@@ -1,0 +1,17 @@
+---
+# This file documents the schema the operator should add to their
+# cc_cli_inventory.yml under `inv_addons.goat`. It's not loaded as vars.
+
+inv_addons:
+  goat:
+    enable: true
+    namespace: "{{ ENVIRONMENT }}-goat-stack"
+    chart:
+      ref: "oci://ghcr.io/plan4better/charts/goat"
+      version: "0.1.0"
+    db:
+      reuse_central: true
+      db_name: goat
+    keycloak:                 # Phase 2 — currently unused
+      realm: "{{ inv_access.keycloak.realm | default('civitas') }}"
+      client_id: goat

@@ -1,0 +1,34 @@
+# /home/p4b/civitas-goat-addon/tasks.yml
+---
+# Civitas-core entry point. Included by the platform playbook via
+# inv_addons.addons fileglob.
+#
+# Uses `import_tasks` (static) instead of `include_tasks` (dynamic) so that
+# tag filters like `--tags goat_addon` propagate down to the inner tasks.
+# include_vars stays dynamic because it has side effects only on success.
+
+- name: GOAT addon — load defaults
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/addons/goat_addon/vars/default.yml"
+  tags: ["goat_addon"]
+
+- name: GOAT addon — load software references
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/addons/goat_addon/vars/software_references.yml"
+  tags: ["goat_addon"]
+
+- name: GOAT addon — namespace
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/00_namespace.yml"
+  tags: ["goat_addon"]
+
+- name: GOAT addon — provision DB user
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/01_db.yml"
+  tags: ["goat_addon"]
+
+- name: GOAT addon — helm install
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/03_helm_install.yml"
+  tags: ["goat_addon"]
+
+- name: GOAT addon — health check
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/99_health_check.yml"
+  tags: ["goat_addon"]

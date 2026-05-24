@@ -1,0 +1,8 @@
+# /home/p4b/civitas-goat-addon/.gitignore
+*.retry
+*.swp
+__pycache__/
+.venv/
+.vscode/
+.idea/
+*.tmp

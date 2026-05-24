@@ -1,0 +1,33 @@
+# /home/p4b/civitas-goat-addon/templates/goat-values.yaml.j2
+# Rendered by 03_helm_install.yml and passed to `helm install` as a values file.
+
+global:
+  storageClass: "{{ inv_k8s.storage_class | default('local-path') }}"
+  imagePullSecrets: []
+  commonLabels:
+    civitas.core/owner: goat-addon
+    civitas.core/env: "{{ ENVIRONMENT }}"
+
+core:
+  enabled: true
+  ingress:
+    enabled: false       # civitas exposes via APISIX in Phase 2; no Ingress in Phase 1
+  auth:
+    enabled: false       # Phase 1: AUTH=false
+
+postgresql:
+  operator:
+    enabled: false       # civitas has Zalando operator cluster-wide
+  cluster:
+    enabled: false
+  external:
+    host: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
+    port: 5432
+    database: "{{ goat_addon.db.name }}"
+    existingSecret: goat-postgres-creds
+    existingSecretUserKey: username
+    existingSecretPasswordKey: password
+    sslMode: prefer
+
+redis:
+  enabled: true          # bundled — light dep, fine inside civitas

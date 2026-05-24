@@ -1,0 +1,14 @@
+# /home/p4b/civitas-goat-addon/tasks/00_namespace.yml
+---
+- name: Ensure GOAT namespace exists
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+          civitas.core/stack: goat

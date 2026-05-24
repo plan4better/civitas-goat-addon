@@ -1,0 +1,17 @@
+# /home/p4b/civitas-goat-addon/vars/default.yml
+---
+goat_addon:
+  namespace: "{{ inv_addons.goat.namespace | default(ENVIRONMENT + '-goat-stack') }}"
+  chart:
+    ref: "{{ inv_addons.goat.chart.ref | default('oci://ghcr.io/plan4better/charts/goat') }}"
+    version: "{{ inv_addons.goat.chart.version | default('0.1.0') }}"
+  db:
+    # The prepared database name. Zalando postgres-operator will auto-create:
+    #   - <name>_owner, <name>_reader, <name>_writer PG roles
+    #   - K8s secrets: <name>-owner-user.<cluster>.credentials..., etc.
+    name: "{{ inv_addons.goat.db.db_name | default('goat') }}"
+    central_db_ns: "{{ inv_central_db.ns_name }}"
+    central_db_name: "central-db"
+  health_check:
+    retries: 30
+    delay_seconds: 10
