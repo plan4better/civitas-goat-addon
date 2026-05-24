@@ -2,7 +2,11 @@
 # Rendered by 03_helm_install.yml and passed to `helm install` as a values file.
 
 global:
-  storageClass: "{{ inv_k8s.storage_class | default('local-path') }}"
+  # inv_k8s.storage_class is a DICT in civitas-core ({loc, rwo, rwx}); the
+  # chart wants a string. Pick `loc` (local, single-node) by default — works
+  # for k3d and local clusters. Operators on multi-node setups should
+  # override this (e.g. inv_k8s.storage_class.rwx) via their inventory.
+  storageClass: "{{ inv_k8s.storage_class.loc | default('local-path') }}"
   imagePullSecrets: []
   commonLabels:
     civitas.core/owner: goat-addon
