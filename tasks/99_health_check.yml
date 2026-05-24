@@ -1,6 +1,13 @@
 # /home/p4b/civitas-goat-addon/tasks/99_health_check.yml
 ---
-- name: Wait for goat-core Deployment to be Available
+# We don't run an explicit `curl /api/healthz` inside the container because
+# the goat-core image is stripped to essentials and ships no curl/wget.
+# Instead we trust the Kubernetes readinessProbe (httpGet on /api/healthz,
+# wired by the chart's templates/core/deployment.yaml). When kubelet flags
+# `readyReplicas >= 1`, the probe has succeeded — so this check is
+# equivalent to a manual curl plus the kubelet's retry/timeout policy.
+
+- name: Wait for goat-core Deployment to be Available (readinessProbe → /api/healthz)
   kubernetes.core.k8s_info:
     kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
     api_version: apps/v1
@@ -14,27 +21,9 @@
     - core_dep.resources | length > 0
     - (core_dep.resources[0].status.readyReplicas | default(0)) >= 1
 
-- name: Find a running core pod
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
-    kind: Pod
-    namespace: "{{ goat_addon.namespace }}"
-    label_selectors:
-      - "app.kubernetes.io/component=core"
-      - "app.kubernetes.io/instance=goat"
-  register: core_pods
-  failed_when: core_pods.resources | length == 0
-
-- name: Curl /api/healthz from inside the core pod
-  kubernetes.core.k8s_exec:
-    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
-    namespace: "{{ goat_addon.namespace }}"
-    pod: "{{ core_pods.resources[0].metadata.name }}"
-    command: curl -sf -o /dev/null -w "%{http_code}" http://localhost:8000/api/healthz
-  register: healthz
-  changed_when: false
-  failed_when: (healthz.stdout | default('') | trim) != "200"
-
 - name: Report success
   ansible.builtin.debug:
-    msg: "GOAT core /api/healthz returned 200 in namespace {{ goat_addon.namespace }}"
+    msg: >
+      ✓ goat-core is Available in namespace {{ goat_addon.namespace }}
+      (readyReplicas={{ core_dep.resources[0].status.readyReplicas }} —
+      readinessProbe on /api/healthz is succeeding).
