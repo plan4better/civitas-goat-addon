@@ -1,34 +1,25 @@
 # /home/p4b/civitas-goat-addon/tasks/04_apisix_routes.yml
 ---
 # Phase 2: register APISIX routes that front the GOAT services with OIDC
-# enforcement via the civitas Keycloak. Pattern mirrors how civitas's
-# existing services get APISIX routes (see core_platform/tasks/access/apis/).
-#
-# After this task runs, requests to civitas's API gateway:
-#   https://api.<DOMAIN>/goat/api/* → goat-core
-#   https://api.<DOMAIN>/goat/web/* → goat-web
-# both pass through APISIX's openid-connect plugin which validates the
-# bearer token against the goat-web client we created in 02_keycloak_client.yml.
+# enforcement via the civitas Keycloak. Pattern mirrors civitas's own
+# task at core_platform/tasks/access/apis/add_api.yaml — same admin URL
+# (https://api-admin.{{ DOMAIN }}), same ca_path, same admin_role key.
 
-- name: "GOAT addon: fetch APISIX admin token from civitas secret"
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
-    api_version: v1
-    kind: Secret
-    namespace: "{{ inv_access.ns_name }}"
-    name: apisix-control-plane-api-token
-  register: apisix_secret
-  failed_when: apisix_secret.resources | length == 0
-
-- name: "GOAT addon: set APISIX admin token fact"
+- name: "GOAT addon: build APISIX upstream node dicts"
+  # Ansible does NOT evaluate Jinja2 expressions inside YAML dict keys, so
+  # we build the upstream.nodes dicts via Jinja2 dict-literal expressions
+  # in set_fact (same workaround as 01_db.yml).
   ansible.builtin.set_fact:
-    apisix_admin_token: "{{ apisix_secret.resources[0].data['admin-token'] | b64decode }}"
-    apisix_admin_url: "http://apisix-control-plane.{{ inv_access.ns_name }}.svc.cluster.local:9180"
+    apisix_upstream_core:
+      "{{ {'goat-core.' + goat_addon.namespace + '.svc.cluster.local:80': 1} }}"
+    apisix_upstream_web:
+      "{{ {'goat-web.' + goat_addon.namespace + '.svc.cluster.local:80': 1} }}"
 
 - name: "GOAT addon: register /goat/api/* route in APISIX"
   uri:
     method: PUT
-    url: "{{ apisix_admin_url }}/apisix/admin/routes/goat-api"
+    url: "https://api-admin.{{ DOMAIN }}/apisix/admin/routes/goat-api"
+    ca_path: "{{ inv_k8s.ingress.ca_path | default(omit) }}"
     body_format: json
     body:
       uri: "/goat/api/*"
@@ -37,30 +28,28 @@
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
       plugins:
         proxy-rewrite:
-          # Strip /goat prefix before forwarding to goat-core
+          # Strip /goat prefix before forwarding to goat-core's /api endpoint
           regex_uri: ["^/goat/api/(.*)", "/api/$1"]
         openid-connect:
           client_id: "{{ goat_addon.keycloak.client_id }}"
-          client_secret: "{{ client_secret | default('') }}"
+          client_secret: "{{ client_secret }}"
           discovery: "{{ inv_access.platform.hostname }}/realms/{{ inv_access.tenant.realm_name }}/.well-known/openid-configuration"
           bearer_only: true
           ssl_verify: false
       upstream:
         type: roundrobin
         scheme: http
-        nodes:
-          "goat-core.{{ goat_addon.namespace }}.svc.cluster.local:80": 1
+        nodes: "{{ apisix_upstream_core }}"
     headers:
-      X-API-KEY: "{{ apisix_admin_token }}"
-      Content-Type: application/json
+      Accept: application/json
+      X-API-KEY: "{{ inv_access.apisix.api_credentials.admin_role }}"
     status_code: [200, 201]
-  # Re-fetch client_secret if 02_keycloak_client.yml ran in a different invocation
-  when: client_secret is defined
 
 - name: "GOAT addon: register /goat/web/* route in APISIX"
   uri:
     method: PUT
-    url: "{{ apisix_admin_url }}/apisix/admin/routes/goat-web"
+    url: "https://api-admin.{{ DOMAIN }}/apisix/admin/routes/goat-web"
+    ca_path: "{{ inv_k8s.ingress.ca_path | default(omit) }}"
     body_format: json
     body:
       uri: "/goat/web/*"
@@ -73,9 +62,8 @@
       upstream:
         type: roundrobin
         scheme: http
-        nodes:
-          "goat-web.{{ goat_addon.namespace }}.svc.cluster.local:80": 1
+        nodes: "{{ apisix_upstream_web }}"
     headers:
-      X-API-KEY: "{{ apisix_admin_token }}"
-      Content-Type: application/json
+      Accept: application/json
+      X-API-KEY: "{{ inv_access.apisix.api_credentials.admin_role }}"
     status_code: [200, 201]
