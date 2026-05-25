@@ -12,3 +12,33 @@
         labels:
           app.kubernetes.io/managed-by: civitas-goat-addon
           civitas.core/stack: goat
+
+# NextAuth (running inside goat-web) makes server-side calls to Keycloak
+# during the OIDC discovery flow. If civitas is using a self-signed CA
+# (typical for local/dev), Node.js will reject the cert with
+# UNABLE_TO_VERIFY_LEAF_SIGNATURE. We mirror cert-manager's root CA into the
+# goat namespace as a ConfigMap and mount it via NODE_EXTRA_CA_CERTS.
+
+- name: "GOAT addon: fetch cert-manager self-signed CA"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: selfsigned-cert-tls
+    namespace: cert-manager
+  register: civitas_ca_secret
+  failed_when: false
+
+- name: "GOAT addon: mirror civitas CA into goat namespace"
+  when: civitas_ca_secret.resources | length > 0
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: civitas-ca
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      data:
+        ca.crt: "{{ civitas_ca_secret.resources[0].data['ca.crt'] | b64decode }}"

@@ -33,10 +33,6 @@
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/03_helm_install.yml"
   tags: ["goat_addon"]
 
-- name: GOAT addon — register APISIX routes
-  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/04_apisix_routes.yml"
-  tags: ["goat_addon"]
-
 - name: GOAT addon — health check
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/99_health_check.yml"
   tags: ["goat_addon"]

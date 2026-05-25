@@ -14,7 +14,7 @@ global:
 core:
   enabled: true
   ingress:
-    enabled: false       # civitas exposes via APISIX (see 04_apisix_routes.yml)
+    enabled: false       # core API stays internal; goat-web calls it via cluster DNS
   auth:
     enabled: true
     existingSecret: goat-keycloak-creds   # created by 02_keycloak_client.yml
@@ -25,6 +25,37 @@ web:
     enabled: true
     existingSecret: goat-keycloak-creds
     publicUrl: "{{ goat_addon.web.public_url }}"
+  # NextAuth runs server-side inside the pod and calls Keycloak over HTTPS.
+  # On local/dev with a self-signed CA, Node rejects the cert unless we
+  # point NODE_EXTRA_CA_CERTS at the bundle mounted below.
+  extraEnv:
+    - name: NODE_EXTRA_CA_CERTS
+      value: /etc/ssl/civitas/ca.crt
+  extraVolumes:
+    - name: civitas-ca
+      configMap:
+        name: civitas-ca
+        optional: true
+  extraVolumeMounts:
+    - name: civitas-ca
+      mountPath: /etc/ssl/civitas
+      readOnly: true
+  ingress:
+    enabled: true
+    className: "{{ inv_k8s.ingress_class }}"
+    annotations:
+      cert-manager.io/cluster-issuer: "{{ inv_k8s.cert_manager.issuer_name }}"
+      kubernetes.io/ingress.class: "{{ inv_k8s.ingress_class }}"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: "{{ goat_addon.web.public_url | regex_replace('^https?://', '') }}"
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: "goat-web-{{ DOMAIN }}-tls"
+        hosts:
+          - "{{ goat_addon.web.public_url | regex_replace('^https?://', '') }}"
 
 postgresql:
   operator:
@@ -43,8 +74,8 @@ postgresql:
 redis:
   enabled: true          # bundled — light dep, fine inside civitas
 
-# Windmill stays off in civitas Phase 2 (no demand yet, and would need its
-# own Postgres user provisioning + APISIX routes).
+# Windmill stays off (no demand yet, and would need its own Postgres user
+# provisioning).
 windmill:
   server:
     enabled: false
@@ -53,4 +84,4 @@ windmill:
       enabled: false
 
 caddy:
-  enabled: false         # civitas's APISIX handles routing for custom domains
+  enabled: false         # goat-web has its own Ingress (above) — no proxy needed
