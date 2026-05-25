@@ -1,0 +1,86 @@
+# /home/p4b/civitas-goat-addon/tasks/05_service_portal_tile.yml
+---
+# Phase 2.1: add a GOAT tile to the civitas service portal landing page
+# (https://<DOMAIN>/).
+#
+# Civitas v1.5 hardcodes app tiles in templates/access/service_portal/apps.js.j2
+# (no extra_apps extension point — that landed in v1.6). We work around it by
+# editing the rendered `apps.js` ConfigMap in-place: strip any prior addon-
+# inserted block, then inject our tile before the closing `];`.
+#
+# The // GOAT_ADDON_TILE_START / END markers keep this idempotent across
+# re-runs of the playbook. When civitas v1.6 + extra_apps becomes the target,
+# this whole task collapses to a one-line inventory entry.
+
+- name: "GOAT addon: fetch current service-portal apps.js ConfigMap"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    api_version: v1
+    kind: ConfigMap
+    namespace: "{{ inv_access.ns_name }}"
+    name: apps.js
+  register: apps_cm
+  failed_when: apps_cm.resources | length == 0
+
+- name: "GOAT addon: build the GOAT tile JS block"
+  ansible.builtin.set_fact:
+    goat_tile_js: |2-
+
+      // GOAT_ADDON_TILE_START — managed by civitas-goat-addon — do not edit manually
+        {
+          id: "goat",
+          name: "GOAT",
+          icon: "/img/masterportal.png",
+          description: {
+            en: "Geo Open Accessibility Tool — spatial analysis, accessibility modeling, and collaborative mapping.",
+            de: "Geo Open Accessibility Tool — Räumliche Analyse, Erreichbarkeitsmodellierung und kollaborative Kartenarbeit."
+          },
+          role: "",
+          url: "{{ goat_addon.web.public_url }}/",
+          iframe: false
+        },
+      // GOAT_ADDON_TILE_END
+
+- name: "GOAT addon: strip any previously-inserted GOAT tile (idempotency)"
+  # (?s) enables DOTALL so `.` matches newlines for the block strip
+  ansible.builtin.set_fact:
+    apps_js_cleaned: "{{ apps_cm.resources[0].data['apps.js']
+                       | regex_replace('(?s)\\s*// GOAT_ADDON_TILE_START.*?// GOAT_ADDON_TILE_END\\s*', '\\n') }}"
+
+- name: "GOAT addon: inject GOAT tile before the closing ];"
+  # IMPORTANT: keep a literal newline between the END marker and `];` —
+  # otherwise the `//` comment swallows `];` and the JS array never closes.
+  ansible.builtin.set_fact:
+    apps_js_patched: "{{ apps_js_cleaned | regex_replace('\\n\\];', goat_tile_js + '\\n];') }}"
+
+- name: "GOAT addon: apply patched apps.js ConfigMap"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: apps.js
+        namespace: "{{ inv_access.ns_name }}"
+      data:
+        apps.js: "{{ apps_js_patched }}"
+  register: cm_apply
+
+- name: "GOAT addon: rollout-restart service-portal so it picks up the new apps.js"
+  # subPath volume mounts don't hot-reload; we trigger a rolling restart by
+  # patching a pod-template annotation.
+  kubernetes.core.k8s:
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    state: patched
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ inv_access.ns_name }}"
+    name: service-portal
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              civitas-goat-addon/restartedAt: "{{ now(utc=true).isoformat() }}"
+  when: cm_apply.changed

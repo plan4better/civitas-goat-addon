@@ -37,6 +37,10 @@
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/04_apisix_routes.yml"
   tags: ["goat_addon"]
 
+- name: GOAT addon — add tile to civitas service portal landing page
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/05_service_portal_tile.yml"
+  tags: ["goat_addon"]
+
 - name: GOAT addon — health check
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/99_health_check.yml"
   tags: ["goat_addon"]
