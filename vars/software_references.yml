@@ -1,5 +1,5 @@
+# /home/p4b/civitas-goat-addon/vars/software_references.yml
 ---
-# Pinned versions for this addon's external dependencies.
 goat_addon_software:
-  chart_version: "0.1.0"
-  app_version_pin: ""   # empty = chart's appVersion default; override to lock a specific GOAT image tag
+  chart_version: "0.3.0"
+  app_version_pin: ""

@@ -4,14 +4,19 @@ goat_addon:
   namespace: "{{ inv_addons.goat.namespace | default(ENVIRONMENT + '-goat-stack') }}"
   chart:
     ref: "{{ inv_addons.goat.chart.ref | default('oci://ghcr.io/plan4better/charts/goat') }}"
-    version: "{{ inv_addons.goat.chart.version | default('0.1.0') }}"
+    version: "{{ inv_addons.goat.chart.version | default('0.3.0') }}"
   db:
-    # The prepared database name. Zalando postgres-operator will auto-create:
-    #   - <name>_owner, <name>_reader, <name>_writer PG roles
-    #   - K8s secrets: <name>-owner-user.<cluster>.credentials..., etc.
     name: "{{ inv_addons.goat.db.db_name | default('goat') }}"
     central_db_ns: "{{ inv_central_db.ns_name }}"
     central_db_name: "central-db"
+  keycloak:
+    # Client ID created in the civitas Keycloak realm. Defaults to `goat-web`,
+    # matching the convention used by plan4better's standalone infra.
+    client_id: "{{ inv_addons.goat.keycloak.client_id | default('goat-web') }}"
+  web:
+    # Public URL of the GOAT web frontend. Used for Keycloak redirect URIs
+    # and NEXTAUTH_URL. Defaults to https://goat.<DOMAIN>.
+    public_url: "{{ inv_addons.goat.web.public_url | default('https://goat.' + DOMAIN) }}"
   health_check:
     retries: 30
     delay_seconds: 10

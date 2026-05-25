@@ -4,8 +4,7 @@
 global:
   # inv_k8s.storage_class is a DICT in civitas-core ({loc, rwo, rwx}); the
   # chart wants a string. Pick `loc` (local, single-node) by default — works
-  # for k3d and local clusters. Operators on multi-node setups should
-  # override this (e.g. inv_k8s.storage_class.rwx) via their inventory.
+  # for k3d and local clusters.
   storageClass: "{{ inv_k8s.storage_class.loc | default('local-path') }}"
   imagePullSecrets: []
   commonLabels:
@@ -15,9 +14,17 @@ global:
 core:
   enabled: true
   ingress:
-    enabled: false       # civitas exposes via APISIX in Phase 2; no Ingress in Phase 1
+    enabled: false       # civitas exposes via APISIX (see 04_apisix_routes.yml)
   auth:
-    enabled: false       # Phase 1: AUTH=false
+    enabled: true
+    existingSecret: goat-keycloak-creds   # created by 02_keycloak_client.yml
+
+web:
+  enabled: true
+  auth:
+    enabled: true
+    existingSecret: goat-keycloak-creds
+    publicUrl: "{{ goat_addon.web.public_url }}"
 
 postgresql:
   operator:
@@ -35,3 +42,15 @@ postgresql:
 
 redis:
   enabled: true          # bundled — light dep, fine inside civitas
+
+# Windmill stays off in civitas Phase 2 (no demand yet, and would need its
+# own Postgres user provisioning + APISIX routes).
+windmill:
+  server:
+    enabled: false
+  workers:
+    default:
+      enabled: false
+
+caddy:
+  enabled: false         # civitas's APISIX handles routing for custom domains

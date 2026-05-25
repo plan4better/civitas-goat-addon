@@ -1,0 +1,22 @@
+{
+  "clientId": "{{ goat_addon.keycloak.client_id }}",
+  "name": "GOAT Web",
+  "description": "OIDC client for the GOAT web frontend (Next.js + NextAuth.js)",
+  "enabled": true,
+  "protocol": "openid-connect",
+  "publicClient": false,
+  "standardFlowEnabled": true,
+  "implicitFlowEnabled": false,
+  "directAccessGrantsEnabled": false,
+  "serviceAccountsEnabled": false,
+  "redirectUris": [
+    "{{ goat_addon.web.public_url }}/*",
+    "{{ goat_addon.web.public_url }}/api/auth/callback/keycloak"
+  ],
+  "webOrigins": [
+    "{{ goat_addon.web.public_url }}"
+  ],
+  "attributes": {
+    "post.logout.redirect.uris": "{{ goat_addon.web.public_url }}/*"
+  }
+}

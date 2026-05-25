@@ -1,17 +1,20 @@
+# /home/p4b/civitas-goat-addon/default_inventory.yml
 ---
-# This file documents the schema the operator should add to their
-# cc_cli_inventory.yml under `inv_addons.goat`. It's not loaded as vars.
-
 inv_addons:
   goat:
     enable: true
     namespace: "{{ ENVIRONMENT }}-goat-stack"
     chart:
       ref: "oci://ghcr.io/plan4better/charts/goat"
-      version: "0.1.0"
+      version: "0.3.0"
     db:
       reuse_central: true
       db_name: goat
-    keycloak:                 # Phase 2 — currently unused
-      realm: "{{ inv_access.keycloak.realm | default('civitas') }}"
-      client_id: goat
+    keycloak:
+      # The OIDC client ID to create in the civitas Keycloak realm.
+      # The realm itself is read from inv_access.tenant.realm_name.
+      client_id: "goat-web"
+    web:
+      # Public-facing URL of the goat-web frontend. Used to set Keycloak
+      # redirect URIs and the NextAuth NEXTAUTH_URL env var.
+      public_url: "https://goat.{{ DOMAIN }}"

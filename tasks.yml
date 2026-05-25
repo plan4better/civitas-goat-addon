@@ -25,8 +25,16 @@
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/01_db.yml"
   tags: ["goat_addon"]
 
+- name: GOAT addon — register Keycloak client
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/02_keycloak_client.yml"
+  tags: ["goat_addon"]
+
 - name: GOAT addon — helm install
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/03_helm_install.yml"
+  tags: ["goat_addon"]
+
+- name: GOAT addon — register APISIX routes
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/04_apisix_routes.yml"
   tags: ["goat_addon"]
 
 - name: GOAT addon — health check

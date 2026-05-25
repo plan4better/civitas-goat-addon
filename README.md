@@ -2,21 +2,43 @@
 
 [CIVITAS/CORE](https://docs.core.civitasconnect.digital/) Ansible addon that installs the [GOAT](https://github.com/plan4better/goat) Helm chart and wires it to civitas's own Postgres (central-db).
 
-## Phase 1 status
+## Phase 2 status
 
-This addon installs the GOAT Helm chart (`oci://ghcr.io/plan4better/charts/goat`) into civitas. The chart's `core` and `web` services are deployed by default; the optional `geoapi`, `accounts`, and `processes` services remain off until their bootstrap requirements (DuckLake init for `geoapi`/`processes`, private GHCR pull secret for `accounts`) are met — see the chart's README for how to enable them.
+This addon installs the GOAT Helm chart (`oci://ghcr.io/plan4better/charts/goat`) into civitas with **real auth** through civitas's Keycloak realm and **APISIX routing** for the API.
 
-**What works in v0.1.x:**
+**What works in v0.2.x:**
 - `<env>-goat-stack` namespace creation
-- `goat` user/database provisioning in civitas's central-db (Zalando postgres-operator's `preparedDatabases`)
-- Helm install of the GOAT chart with civitas-profile values
-- Readiness gate on `goat-core` (chart's readinessProbe on `/api/healthz`)
+- `goat` user/database provisioning in civitas's central-db
+- Keycloak `goat-web` OIDC client provisioning in the civitas realm (idempotent)
+- K8s Secret `goat-keycloak-creds` populated with `server-url`, `realm`, `client-id`, `client-secret`, `nextauth-secret`
+- Helm install of GOAT chart v0.3.0 with `core.auth.enabled: true` + `web.auth.enabled: true`
+- APISIX routes `/goat/api/*` (OIDC-enforced) and `/goat/web/*` (passthrough — web handles its own login)
+- Readiness gate on `goat-core`
 
-**Deferred to Phase 2:**
-- Keycloak client registration (`02_keycloak_client.yml`)
-- APISIX route registration (`04_apisix_routes.yml`)
+## Inventory
 
-Auth is disabled (`core.auth.enabled: false`) until Phase 2.
+Full schema for the operator's `cc_cli_inventory.yml` under `inv_addons.goat`:
+
+```yaml
+inv_addons:
+  goat:
+    enable: true
+    namespace: "{{ ENVIRONMENT }}-goat-stack"
+    chart:
+      ref: "oci://ghcr.io/plan4better/charts/goat"
+      version: "0.3.0"
+    db:
+      reuse_central: true
+      db_name: goat
+    keycloak:
+      # The OIDC client ID to create in the civitas Keycloak realm.
+      # The realm itself is read from inv_access.tenant.realm_name.
+      client_id: "goat-web"
+    web:
+      # Public-facing URL of the goat-web frontend. Used to set Keycloak
+      # redirect URIs and the NextAuth NEXTAUTH_URL env var.
+      public_url: "https://goat.{{ DOMAIN }}"
+```
 
 ## How to use
 
@@ -26,11 +48,11 @@ In your civitas-core fork:
 # Civitas-core's .gitignore excludes `core_platform/addons/`, so the addon
 # is cloned directly (not added as a tracked submodule). The Ansible
 # playbook reads files from the path regardless of git state.
-git clone --branch v0.1.2 https://github.com/plan4better/civitas-goat-addon.git \
+git clone --branch v0.2.0 https://github.com/plan4better/civitas-goat-addon.git \
           core_platform/addons/goat_addon
 ```
 
-In your inventory file (`cc_cli_inventory.yml` or equivalent):
+In your inventory file (`cc_cli_inventory.yml` or equivalent), set the keys under `inv_addons.goat` documented in the [Inventory](#inventory) section above. Don't forget to also register the addon's `tasks.yml`:
 
 ```yaml
 inv_addons:
@@ -38,14 +60,7 @@ inv_addons:
   addons:
     - "addons/goat_addon/tasks.yml"
   goat:
-    enable: true
-    namespace: "{{ ENVIRONMENT }}-goat-stack"
-    chart:
-      ref: "oci://ghcr.io/plan4better/charts/goat"
-      version: "0.1.0"
-    db:
-      reuse_central: true
-      db_name: goat
+    # ...see Inventory schema above...
 ```
 
 Then run the civitas playbook scoped to addons:
@@ -66,11 +81,12 @@ ok: [localhost] => {
 
 ## Compatibility
 
-| addon | civitas-core | GOAT chart |
-|---|---|---|
-| **v0.1.2** *(current)* | v1.5.x+ | v0.1.x |
-| v0.1.1 | v1.5.x+ | v0.1.x |
-| v0.1.0 | v1.5.x+ | v0.1.0 |
+| addon | civitas-core | GOAT chart | notes |
+|---|---|---|---|
+| **v0.2.0** *(current)* | v1.5.x+ | v0.3.x | Adds Keycloak client + APISIX routes |
+| v0.1.2 | v1.5.x+ | v0.1.x | |
+| v0.1.1 | v1.5.x+ | v0.1.x | |
+| v0.1.0 | v1.5.x+ | v0.1.0 | |
 
 Addon version is independent of civitas-core's. Tag the addon based on its own semver; consult this table for compatibility.
 
@@ -88,12 +104,6 @@ Addon version is independent of civitas-core's. Tag the addon based on its own s
 - **Pre-existing `postgrescluster.yml` bug** in civitas-core: running the playbook without scoped tags can fail with an undefined `postgres_password` variable. Always scope to `--tags "addons,goat_addon"`.
 
 - **`goat-core` has no curl**: the image is stripped to essentials. Don't write tasks that `kubernetes.core.k8s_exec` shell-out into the container; rely on Kubernetes probes instead.
-
-## Phase 2 roadmap
-
-Coming in v0.2.x:
-- `02_keycloak_client.yml` — register a `goat` OIDC client in the civitas Keycloak realm using the `keycloak.openid` Ansible collection. Stores the client-secret in a K8s Secret in the goat namespace; the chart's `core.auth.enabled: true` consumes it.
-- `04_apisix_routes.yml` — register `/goat/api/*` and similar routes in APISIX so the goat services are reachable through civitas's API gateway with OIDC enforcement.
 
 ## License
 

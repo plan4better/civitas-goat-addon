@@ -1,0 +1,91 @@
+# /home/p4b/civitas-goat-addon/tasks/02_keycloak_client.yml
+---
+# Phase 2: provision a Keycloak OIDC client for GOAT in civitas's Keycloak.
+# Pattern mirrors how civitas registers Grafana/Superset/etc.
+#
+# After this task runs, the K8s Secret `goat-keycloak-creds` exists in the
+# goat namespace with keys: server-url, realm, client-id, client-secret,
+# nextauth-secret. The chart's auth.existingSecret consumes it.
+
+- name: "GOAT addon: login to civitas Keycloak as platform admin"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/templates/keycloak_login.yaml"
+
+- name: "GOAT addon: check if goat-web client already exists"
+  uri:
+    method: GET
+    url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/clients?clientId={{ goat_addon.keycloak.client_id }}"
+    ca_path: "{{ inv_k8s.ingress.ca_path | default(omit) }}"
+    return_content: yes
+    headers:
+      Accept: application/json
+      Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+    status_code: 200
+  register: existing_client
+  check_mode: no
+
+- name: "GOAT addon: create goat-web client when absent"
+  uri:
+    method: POST
+    url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/clients"
+    ca_path: "{{ inv_k8s.ingress.ca_path | default(omit) }}"
+    body_format: json
+    body: "{{ lookup('template', playbook_dir + '/addons/goat_addon/templates/goat-keycloak-client.json.j2') }}"
+    headers:
+      Accept: application/json
+      Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+    status_code: 201
+  when: existing_client.json | length == 0
+
+- name: "GOAT addon: fetch goat-web client secret"
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/templates/keycloak_client_secret.yaml"
+  vars:
+    module: "GOAT addon"
+    client_id: "{{ goat_addon.keycloak.client_id }}"
+
+# At this point, `client_secret` is set by the included civitas template.
+
+- name: "GOAT addon: generate or fetch a stable NEXTAUTH_SECRET"
+  # NextAuth.js needs a signing secret. We store it in the same K8s Secret
+  # alongside the Keycloak client secret. Generated once per release; on
+  # re-runs we keep the previous value if the K8s Secret already exists.
+  block:
+    - name: "GOAT addon: check for existing goat-keycloak-creds"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+        api_version: v1
+        kind: Secret
+        namespace: "{{ goat_addon.namespace }}"
+        name: goat-keycloak-creds
+      register: existing_keycloak_secret
+
+    - name: "GOAT addon: reuse existing NEXTAUTH_SECRET if available"
+      ansible.builtin.set_fact:
+        nextauth_secret: "{{ existing_keycloak_secret.resources[0].data['nextauth-secret'] | b64decode }}"
+      when:
+        - existing_keycloak_secret.resources | length > 0
+        - existing_keycloak_secret.resources[0].data['nextauth-secret'] is defined
+
+    - name: "GOAT addon: generate a new NEXTAUTH_SECRET if none exists"
+      ansible.builtin.set_fact:
+        nextauth_secret: "{{ lookup('password', '/dev/null length=48 chars=ascii_letters,digits') }}"
+      when: nextauth_secret is not defined
+
+- name: "GOAT addon: create/update goat-keycloak-creds K8s Secret"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: goat-keycloak-creds
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      type: Opaque
+      stringData:
+        server-url: "{{ inv_access.platform.hostname }}"
+        realm: "{{ inv_access.tenant.realm_name }}"
+        client-id: "{{ goat_addon.keycloak.client_id }}"
+        client-secret: "{{ client_secret }}"
+        nextauth-secret: "{{ nextauth_secret }}"
