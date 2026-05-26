@@ -25,6 +25,10 @@
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/01_db.yml"
   tags: ["goat_addon"]
 
+- name: GOAT addon — deploy MinIO + bucket
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/05_minio.yml"
+  tags: ["goat_addon"]
+
 - name: GOAT addon — register Keycloak client
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/02_keycloak_client.yml"
   tags: ["goat_addon"]

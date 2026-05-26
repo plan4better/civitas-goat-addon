@@ -1,5 +1,12 @@
 # /home/p4b/civitas-goat-addon/templates/goat-values.yaml.j2
 # Rendered by 03_helm_install.yml and passed to `helm install` as a values file.
+#
+# Hostname convention follows civitas-core's piveau pattern: the user-facing
+# app sits at <app>.<DOMAIN> and each backend gets <service>.<app>.<DOMAIN>.
+{%- set goat_host = goat_addon.web.public_url | regex_replace('^https?://', '') %}
+{%- set core_host = 'core.' + goat_host %}
+{%- set geoapi_host = 'geoapi.' + goat_host %}
+{%- set processes_host = 'processes.' + goat_host %}
 
 global:
   # inv_k8s.storage_class is a DICT in civitas-core ({loc, rwo, rwx}); the
@@ -13,24 +20,69 @@ global:
 
 core:
   enabled: true
+  # goat-web's bundle calls the core API from the browser directly
+  # (NEXT_PUBLIC_API_URL is baked in), so core must be reachable externally.
   ingress:
-    enabled: false       # core API stays internal; goat-web calls it via cluster DNS
+    enabled: true
+    className: "{{ inv_k8s.ingress_class }}"
+    annotations:
+      cert-manager.io/cluster-issuer: "{{ inv_k8s.cert_manager.issuer_name }}"
+      kubernetes.io/ingress.class: "{{ inv_k8s.ingress_class }}"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: "{{ core_host }}"
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: "goat-core-{{ DOMAIN }}-tls"
+        hosts:
+          - "{{ core_host }}"
   auth:
     enabled: true
     existingSecret: goat-keycloak-creds   # created by 02_keycloak_client.yml
 
-web:
+geoapi:
   enabled: true
-  auth:
-    enabled: true
-    existingSecret: goat-keycloak-creds
-    publicUrl: "{{ goat_addon.web.public_url }}"
-  # NextAuth runs server-side inside the pod and calls Keycloak over HTTPS.
-  # On local/dev with a self-signed CA, Node rejects the cert unless we
-  # point NODE_EXTRA_CA_CERTS at the bundle mounted below.
+  config:
+    ENVIRONMENT: prod
+    DUCKLAKE_CREATE_IF_NOT_EXISTS: "true"
+    # geoapi's own auth (separate from goat-web's NextAuth flow). It fetches
+    # the realm public key from `<KEYCLOAK_SERVER_URL>/realms/<REALM_NAME>` at
+    # startup via Python requests — must trust civitas's self-signed CA, so
+    # we set REQUESTS_CA_BUNDLE + SSL_CERT_FILE in extraEnv below.
+    AUTH: "true"
+    KEYCLOAK_SERVER_URL: "{{ inv_access.platform.hostname }}"
+    REALM_NAME: "{{ inv_access.tenant.realm_name }}"
+    # Postgres connection for the DuckLake catalog schema. POSTGRES_USER /
+    # POSTGRES_PASSWORD are auto-wired by the chart from the same secret as
+    # goat-core (goat-postgres-creds → goat user). Same DB, separate schema.
+    POSTGRES_SERVER: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: "{{ goat_addon.db.name }}"
+    DUCKLAKE_CATALOG_SCHEMA: "ducklake"
+    # DATA_PATH for the DuckLake ATTACH. Must match what 05_minio.yml passed
+    # to the ducklake-init Job. Upstream compose keeps this as a LOCAL path
+    # even with S3 enabled — DuckLake stores parquet in S3 transparently via
+    # the s3_* SET commands; the local path is just the catalog marker.
+    DUCKLAKE_DATA_DIR: "/app/data/ducklake"
+    # S3 (MinIO inside the goat namespace — see tasks/05_minio.yml)
+    S3_PROVIDER: "minio"
+    S3_ENDPOINT_URL: "http://minio.{{ goat_addon.namespace }}.svc.cluster.local:9000"
+    S3_REGION: "us-east-1"
+    S3_BUCKET_NAME: "{{ goat_addon.minio.bucket }}"
   extraEnv:
-    - name: NODE_EXTRA_CA_CERTS
+    # Python requests/httpx/urllib use these envs to find a CA bundle.
+    - name: REQUESTS_CA_BUNDLE
       value: /etc/ssl/civitas/ca.crt
+    - name: SSL_CERT_FILE
+      value: /etc/ssl/civitas/ca.crt
+    - name: S3_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef: { name: minio-credentials, key: access_key }
+    - name: S3_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef: { name: minio-credentials, key: secret_key }
   extraVolumes:
     - name: civitas-ca
       configMap:
@@ -48,14 +100,151 @@ web:
       kubernetes.io/ingress.class: "{{ inv_k8s.ingress_class }}"
       nginx.ingress.kubernetes.io/ssl-redirect: "true"
     hosts:
-      - host: "{{ goat_addon.web.public_url | regex_replace('^https?://', '') }}"
+      - host: "{{ geoapi_host }}"
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: "goat-geoapi-{{ DOMAIN }}-tls"
+        hosts:
+          - "{{ geoapi_host }}"
+
+# `processes` is the job-submission API surface. It normally hands jobs off to
+# Windmill for execution; we don't run Windmill in civitas (out of scope per
+# the addon spec), so any endpoint that submits/inspects a Windmill job will
+# 500. The READ side (DuckLake catalog metadata, process listing) works.
+# Wire it to the same Postgres / MinIO / Keycloak / CA bundle as geoapi.
+processes:
+  enabled: true
+  config:
+    ENVIRONMENT: prod
+    AUTH: "true"
+    KEYCLOAK_SERVER_URL: "{{ inv_access.platform.hostname }}"
+    REALM_NAME: "{{ inv_access.tenant.realm_name }}"
+    POSTGRES_SERVER: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: "{{ goat_addon.db.name }}"
+    DUCKLAKE_CATALOG_SCHEMA: "ducklake"
+    DUCKLAKE_DATA_DIR: "/app/data/ducklake"
+    # processes' config.py declares BOTH S3_* (boto3-style) AND DUCKLAKE_S3_*
+    # (consumed by goatlib's DuckLake managers via getattr on settings).
+    S3_PROVIDER: "minio"
+    S3_ENDPOINT_URL: "http://minio.{{ goat_addon.namespace }}.svc.cluster.local:9000"
+    S3_REGION: "us-east-1"
+    S3_BUCKET_NAME: "{{ goat_addon.minio.bucket }}"
+    DUCKLAKE_S3_ENDPOINT: "minio.{{ goat_addon.namespace }}.svc.cluster.local:9000"
+    DUCKLAKE_S3_BUCKET: "{{ goat_addon.minio.bucket }}"
+    # Windmill not deployed — explicit stub so misuse fails loudly rather than
+    # quietly hitting the chart default `http://windmill-server:8000`.
+    WINDMILL_URL: "http://windmill-disabled.invalid"
+    WINDMILL_WORKSPACE: "goat"
+  extraEnv:
+    - name: REQUESTS_CA_BUNDLE
+      value: /etc/ssl/civitas/ca.crt
+    - name: SSL_CERT_FILE
+      value: /etc/ssl/civitas/ca.crt
+    - name: S3_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef: { name: minio-credentials, key: access_key }
+    - name: S3_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef: { name: minio-credentials, key: secret_key }
+    - name: DUCKLAKE_S3_ACCESS_KEY
+      valueFrom:
+        secretKeyRef: { name: minio-credentials, key: access_key }
+    - name: DUCKLAKE_S3_SECRET_KEY
+      valueFrom:
+        secretKeyRef: { name: minio-credentials, key: secret_key }
+  extraVolumes:
+    - name: civitas-ca
+      configMap:
+        name: civitas-ca
+        optional: true
+  extraVolumeMounts:
+    - name: civitas-ca
+      mountPath: /etc/ssl/civitas
+      readOnly: true
+  ingress:
+    enabled: true
+    className: "{{ inv_k8s.ingress_class }}"
+    annotations:
+      cert-manager.io/cluster-issuer: "{{ inv_k8s.cert_manager.issuer_name }}"
+      kubernetes.io/ingress.class: "{{ inv_k8s.ingress_class }}"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: "{{ processes_host }}"
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: "goat-processes-{{ DOMAIN }}-tls"
+        hosts:
+          - "{{ processes_host }}"
+
+web:
+  enabled: true
+  auth:
+    enabled: true
+    existingSecret: goat-keycloak-creds
+    publicUrl: "{{ goat_addon.web.public_url }}"
+  # NextAuth runs server-side inside the pod and calls Keycloak over HTTPS.
+  # On local/dev with a self-signed CA, Node rejects the cert unless we
+  # point NODE_EXTRA_CA_CERTS at the bundle mounted below.
+  extraEnv:
+    - name: NODE_EXTRA_CA_CERTS
+      value: /etc/ssl/civitas/ca.crt
+    # Browser-side: goat-web's SPA calls each backend directly. entrypoint.sh
+    # substitutes APP_NEXT_PUBLIC_* placeholders in the bundle at start.
+    - name: NEXT_PUBLIC_API_URL
+      value: "https://{{ core_host }}"
+    - name: NEXT_PUBLIC_APP_URL
+      value: "{{ goat_addon.web.public_url }}"
+    # GEOAPI_URL + PROCESSES_URL wired to real backends. ACCOUNTS_API_URL is
+    # parked — accounts service not deployed; bundle calls `new URL()` on it
+    # at module-load time so the value must still be a valid absolute URL.
+    - name: NEXT_PUBLIC_GEOAPI_URL
+      value: "https://{{ geoapi_host }}"
+    - name: NEXT_PUBLIC_PROCESSES_URL
+      value: "https://{{ processes_host }}"
+    - name: NEXT_PUBLIC_ACCOUNTS_API_URL
+      value: "https://accounts.{{ goat_host }}"
+    - name: NEXT_PUBLIC_ACCOUNTS_DISABLED
+      value: "true"
+  extraVolumes:
+    - name: civitas-ca
+      configMap:
+        name: civitas-ca
+        optional: true
+  extraVolumeMounts:
+    - name: civitas-ca
+      mountPath: /etc/ssl/civitas
+      readOnly: true
+  ingress:
+    enabled: true
+    className: "{{ inv_k8s.ingress_class }}"
+    annotations:
+      cert-manager.io/cluster-issuer: "{{ inv_k8s.cert_manager.issuer_name }}"
+      kubernetes.io/ingress.class: "{{ inv_k8s.ingress_class }}"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: "{{ goat_host }}"
         paths:
           - path: /
             pathType: Prefix
     tls:
       - secretName: "goat-web-{{ DOMAIN }}-tls"
         hosts:
-          - "{{ goat_addon.web.public_url | regex_replace('^https?://', '') }}"
+          - "{{ goat_host }}"
+    # KNOWN GOTCHA: Next.js serves /_next/static/chunks/*.js with
+    # `cache-control: immutable`. entrypoint.sh sed-substitutes NEXT_PUBLIC_*
+    # placeholders at pod start, mutating bytes WITHOUT changing chunk
+    # filenames — so browsers that loaded the page before the substitution
+    # was complete (or any future NEXT_PUBLIC_* config change) will keep
+    # serving stale pre-substitution bytes forever. Civitas's ingress-nginx
+    # has `allow-snippet-annotations: false` cluster-wide, so we cannot
+    # override the Cache-Control header here. Workaround: clear site data
+    # in DevTools after any NEXT_PUBLIC_* change. Long-term fix belongs
+    # upstream in the GOAT image (regenerate chunk hashes post-sed).
 
 postgresql:
   operator:

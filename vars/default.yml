@@ -17,6 +17,9 @@ goat_addon:
     # Public URL of the GOAT web frontend. Used for Keycloak redirect URIs
     # and NEXTAUTH_URL. Defaults to https://goat.<DOMAIN>.
     public_url: "{{ inv_addons.goat.web.public_url | default('https://goat.' + DOMAIN) }}"
+  minio:
+    # MinIO bucket name. DuckLake parquet files + uploaded assets land here.
+    bucket: "{{ inv_addons.goat.minio.bucket | default('goat') }}"
   health_check:
     retries: 30
     delay_seconds: 10

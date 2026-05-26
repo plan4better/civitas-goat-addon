@@ -1,0 +1,343 @@
+# /home/p4b/civitas-goat-addon/tasks/05_minio.yml
+---
+# geoapi (and the chart's `processes` service when enabled) need S3-compatible
+# object storage to back the DuckLake data files. The GOAT chart doesn't ship
+# MinIO yet (planned for chart Phase 2/3 per Chart.yaml), and civitas-core
+# doesn't have a cluster-wide object store either. So we run a minimal
+# single-replica MinIO inside the goat namespace, with a bucket-create Job.
+#
+# Mirrors plan4better's compose.yaml topology (quay.io/minio images).
+# Single-replica + PVC = fine for local/dev; not HA, not for prod scale.
+
+- name: "GOAT addon: generate or reuse MinIO root credentials"
+  block:
+    - name: "GOAT addon: check for existing minio-credentials secret"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: minio-credentials
+        namespace: "{{ goat_addon.namespace }}"
+      register: minio_existing
+
+    - name: "GOAT addon: reuse existing MinIO credentials"
+      ansible.builtin.set_fact:
+        minio_access_key: "{{ minio_existing.resources[0].data.access_key | b64decode }}"
+        minio_secret_key: "{{ minio_existing.resources[0].data.secret_key | b64decode }}"
+      when: minio_existing.resources | length > 0
+
+    - name: "GOAT addon: generate new MinIO credentials"
+      ansible.builtin.set_fact:
+        minio_access_key: "goat-{{ lookup('community.general.random_string', length=12, special=false) | lower }}"
+        minio_secret_key: "{{ lookup('community.general.random_string', length=40, special=false) }}"
+      when: minio_existing.resources | length == 0
+
+- name: "GOAT addon: persist MinIO credentials secret"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: minio-credentials
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      type: Opaque
+      stringData:
+        access_key: "{{ minio_access_key }}"
+        secret_key: "{{ minio_secret_key }}"
+
+- name: "GOAT addon: deploy MinIO (server + PVC + service)"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ item }}"
+  loop:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: minio-data
+        namespace: "{{ goat_addon.namespace }}"
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: "{{ inv_k8s.storage_class.loc | default('local-path') }}"
+        resources:
+          requests:
+            storage: 10Gi
+    - apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: minio
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app: minio
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate  # single-replica + RWO PVC → can't rolling-update
+        selector:
+          matchLabels:
+            app: minio
+        template:
+          metadata:
+            labels:
+              app: minio
+          spec:
+            containers:
+              - name: minio
+                image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+                args: ["server", "--console-address", ":9001", "/data/s3"]
+                ports:
+                  - { name: api, containerPort: 9000 }
+                  - { name: console, containerPort: 9001 }
+                env:
+                  - name: MINIO_ROOT_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: minio-credentials
+                        key: access_key
+                  - name: MINIO_ROOT_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: minio-credentials
+                        key: secret_key
+                readinessProbe:
+                  httpGet: { path: /minio/health/ready, port: 9000 }
+                  periodSeconds: 5
+                volumeMounts:
+                  - { name: data, mountPath: /data }
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: minio-data
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        name: minio
+        namespace: "{{ goat_addon.namespace }}"
+      spec:
+        selector:
+          app: minio
+        ports:
+          - { name: api, port: 9000, targetPort: 9000 }
+          - { name: console, port: 9001, targetPort: 9001 }
+
+- name: "GOAT addon: wait for MinIO to be ready"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: minio
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 180
+
+# `mc mb` is idempotent — re-running the Job is safe but wastes pod scheduling
+# time. We delete any prior bucket-init Job (Job specs are immutable; can't
+# helm-patch in place) and recreate fresh each addon run.
+- name: "GOAT addon: clean up prior bucket-init Job"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: minio-bucket-init
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+
+- name: "GOAT addon: create goat bucket in MinIO"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: minio-bucket-init
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        backoffLimit: 3
+        template:
+          spec:
+            restartPolicy: OnFailure
+            containers:
+              - name: mc
+                image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+                env:
+                  - name: MC_ACCESS_KEY
+                    valueFrom:
+                      secretKeyRef: { name: minio-credentials, key: access_key }
+                  - name: MC_SECRET_KEY
+                    valueFrom:
+                      secretKeyRef: { name: minio-credentials, key: secret_key }
+                command: ["/bin/sh", "-c"]
+                args:
+                  - |
+                    set -euo pipefail
+                    mc alias set goat http://minio:9000 "$MC_ACCESS_KEY" "$MC_SECRET_KEY"
+                    mc mb --ignore-existing goat/{{ goat_addon.minio.bucket }}
+                    echo "bucket goat/{{ goat_addon.minio.bucket }} ready"
+
+- name: "GOAT addon: wait for bucket-init Job to complete"
+  kubernetes.core.k8s_info:
+    api_version: batch/v1
+    kind: Job
+    name: minio-bucket-init
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+    wait_condition:
+      type: Complete
+      status: "True"
+    wait_timeout: 120
+
+# DuckLake bootstrap. The chart's `DUCKLAKE_CREATE_IF_NOT_EXISTS` env var is
+# unused dead config — geoapi attaches in READ_ONLY mode and DuckDB refuses
+# to create a missing lake. The lake must already exist before any read-only
+# consumer (geoapi, future processes) starts. A small Python script does the
+# initial ATTACH (read-write, no READ_ONLY flag) which creates the catalog
+# tables in Postgres + the metadata layout in S3.
+- name: "GOAT addon: fetch goat-postgres-creds for ducklake init"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: goat-postgres-creds
+    namespace: "{{ goat_addon.namespace }}"
+  register: goat_pg_creds
+
+- name: "GOAT addon: create ducklake-init script ConfigMap"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ducklake-init-script
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      data:
+        init.py: |
+          """One-shot DuckLake catalog bootstrap. Read env vars for connection
+          details, then ATTACH the lake in read-write mode so DuckDB creates
+          the catalog schema + S3 layout if missing."""
+          import os
+          import duckdb
+
+          con = duckdb.connect()
+          for ext in ("spatial", "httpfs", "postgres", "ducklake"):
+              con.execute(f"INSTALL {ext}; LOAD {ext};")
+
+          con.execute("SET s3_endpoint = ?;", [os.environ["S3_ENDPOINT"]])
+          con.execute("SET s3_access_key_id = ?;", [os.environ["S3_KEY"]])
+          con.execute("SET s3_secret_access_key = ?;", [os.environ["S3_SECRET"]])
+          con.execute("SET s3_url_style = 'path';")
+          con.execute("SET s3_use_ssl = false;")
+
+          pg_uri = (
+              f"host={os.environ['PG_HOST']} port=5432 "
+              f"user={os.environ['PG_USER']} password={os.environ['PG_PASS']} "
+              f"dbname={os.environ['PG_DB']} "
+              f"keepalives=1 keepalives_idle=30 keepalives_interval=5 "
+              f"keepalives_count=5"
+          )
+
+          # Local path matches DUCKLAKE_DATA_DIR in goat-values.yaml.j2.
+          # DuckLake stores parquet in S3 via the s3_* SET commands above;
+          # the local path is the catalog/ATTACH marker only.
+          data_path = "/app/data/ducklake"
+          os.makedirs(data_path, exist_ok=True)
+          schema = os.environ["SCHEMA"]
+
+          # No READ_ONLY → DuckDB creates the catalog if it doesn't exist.
+          con.execute(
+              f"ATTACH 'ducklake:postgres:{pg_uri}' AS lake ("
+              f"  DATA_PATH '{data_path}',"
+              f"  METADATA_SCHEMA '{schema}'"
+              f")"
+          )
+          print(f"DuckLake initialized: schema={schema} data={data_path}")
+          con.close()
+
+- name: "GOAT addon: clean up prior ducklake-init Job"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: ducklake-init
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+
+- name: "GOAT addon: bootstrap DuckLake catalog (one-shot)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: ducklake-init
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        backoffLimit: 3
+        template:
+          spec:
+            restartPolicy: OnFailure
+            containers:
+              - name: init
+                image: python:3.11-slim
+                env:
+                  - name: PG_HOST
+                    value: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
+                  - name: PG_USER
+                    valueFrom:
+                      secretKeyRef: { name: goat-postgres-creds, key: username }
+                  - name: PG_PASS
+                    valueFrom:
+                      secretKeyRef: { name: goat-postgres-creds, key: password }
+                  - name: PG_DB
+                    value: "{{ goat_addon.db.name }}"
+                  - name: S3_ENDPOINT
+                    value: "minio.{{ goat_addon.namespace }}.svc.cluster.local:9000"
+                  - name: S3_KEY
+                    valueFrom:
+                      secretKeyRef: { name: minio-credentials, key: access_key }
+                  - name: S3_SECRET
+                    valueFrom:
+                      secretKeyRef: { name: minio-credentials, key: secret_key }
+                  - name: BUCKET
+                    value: "{{ goat_addon.minio.bucket }}"
+                  - name: SCHEMA
+                    value: "ducklake"
+                command: ["sh", "-c"]
+                args:
+                  - |
+                    set -e
+                    # Pin duckdb to match goatlib's `duckdb>=1.4.3` minimum:
+                    # newer duckdb versions ship a newer DuckLake extension
+                    # that creates catalogs geoapi's bundled goatlib can't
+                    # read ("Only DuckLake versions 0.1-0.3 are supported").
+                    pip install --quiet --no-cache-dir 'duckdb==1.4.3'
+                    python /scripts/init.py
+                volumeMounts:
+                  - name: script
+                    mountPath: /scripts
+                    readOnly: true
+            volumes:
+              - name: script
+                configMap:
+                  name: ducklake-init-script
+
+- name: "GOAT addon: wait for DuckLake bootstrap Job"
+  kubernetes.core.k8s_info:
+    api_version: batch/v1
+    kind: Job
+    name: ducklake-init
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+    wait_condition:
+      type: Complete
+      status: "True"
+    wait_timeout: 300
