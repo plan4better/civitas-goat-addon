@@ -4,7 +4,7 @@ goat_addon:
   namespace: "{{ inv_addons.goat.namespace | default(ENVIRONMENT + '-goat-stack') }}"
   chart:
     ref: "{{ inv_addons.goat.chart.ref | default('oci://ghcr.io/plan4better/charts/goat') }}"
-    version: "{{ inv_addons.goat.chart.version | default('0.3.1') }}"
+    version: "{{ inv_addons.goat.chart.version | default('0.3.2') }}"
   db:
     name: "{{ inv_addons.goat.db.db_name | default('goat') }}"
     central_db_ns: "{{ inv_central_db.ns_name }}"
@@ -20,6 +20,13 @@ goat_addon:
   minio:
     # MinIO bucket name. DuckLake parquet files + uploaded assets land here.
     bucket: "{{ inv_addons.goat.minio.bucket | default('goat') }}"
+  windmill:
+    # Windmill workspace + bootstrap-admin credentials. Defaults match
+    # plan4better's compose env (admin@windmill.dev / changeme) — change
+    # in non-local environments.
+    workspace: "{{ inv_addons.goat.windmill.workspace | default('goat') }}"
+    admin_email: "{{ inv_addons.goat.windmill.admin_email | default('admin@windmill.dev') }}"
+    admin_password: "{{ inv_addons.goat.windmill.admin_password | default('changeme') }}"
   health_check:
     retries: 30
     delay_seconds: 10

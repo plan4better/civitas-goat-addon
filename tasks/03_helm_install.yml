@@ -16,6 +16,9 @@
     values_files:
       - "/tmp/goat-values-{{ goat_addon.namespace }}.yaml"
     wait: true
-    wait_timeout: 5m
+    # Windmill server bootstraps its schema in Postgres on first start +
+    # downloads worker images (~600MB each). 5m is too tight; 15m gives
+    # local clusters enough headroom while still failing fast on hangs.
+    wait_timeout: 15m
     atomic: true
     kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"

@@ -1,0 +1,92 @@
+# /home/p4b/civitas-goat-addon/tasks/01b_windmill_db.yml
+---
+# Provision a dedicated `windmill` Postgres database in civitas's central-db,
+# mirroring how `01_db.yml` provisions `goat`. We don't put windmill in the
+# goat DB: its migrations write ~100 tables and require role-creation
+# privileges that the goat user doesn't have. A separate DB keeps things
+# clean and matches plan4better's compose topology (DATABASE_URL=.../windmill).
+#
+# This runs after 01_db.yml (which patches the same postgresql CR) and
+# before 03_helm_install.yml (which deploys windmill server).
+
+- name: Build windmill preparedDatabases patch
+  ansible.builtin.set_fact:
+    windmill_prepared_db_patch: >-
+      {{ {'windmill': {'defaultUsers': true}} }}
+
+# server-side apply MERGES the new key into preparedDatabases without
+# losing the `goat` entry that 01_db.yml added.
+- name: Patch civitas central-db with windmill prepared database
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    apply: true
+    definition:
+      apiVersion: acid.zalan.do/v1
+      kind: postgresql
+      metadata:
+        name: "{{ goat_addon.db.central_db_name }}"
+      spec:
+        preparedDatabases: "{{ windmill_prepared_db_patch }}"
+
+- name: Wait for windmill owner-user secret to be created by postgres-operator
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    name: "windmill-owner-user.{{ goat_addon.db.central_db_name }}.credentials.postgresql.acid.zalan.do"
+  register: windmill_db_secret
+  retries: 30
+  delay: 5
+  until: windmill_db_secret.resources | length > 0
+
+- name: Copy windmill owner-user secret into the goat namespace
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: windmill-postgres-creds
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      type: Opaque
+      data:
+        username: "{{ windmill_db_secret.resources[0].data.username }}"
+        password: "{{ windmill_db_secret.resources[0].data.password }}"
+
+# Windmill expects `windmill_admin` and `windmill_user` roles to pre-exist
+# (its first migration runs `GRANT ... TO windmill_admin` and aborts on
+# missing role). Create them and grant to the windmill DB owner so its
+# subsequent migrations can run under its own identity.
+- name: Find central-db primary pod
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    label_selectors:
+      - "application=spilo"
+      - "spilo-role=master"
+  register: central_db_master
+
+- name: Pre-create windmill_admin / windmill_user roles
+  ansible.builtin.command:
+    cmd: >-
+      kubectl -n {{ goat_addon.db.central_db_ns }}
+      exec {{ central_db_master.resources[0].metadata.name }} -c postgres --
+      psql -U postgres -d windmill -v ON_ERROR_STOP=1 -c
+      "DO $$ BEGIN
+         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'windmill_admin') THEN
+           CREATE ROLE windmill_admin WITH NOLOGIN;
+         END IF;
+         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'windmill_user') THEN
+           CREATE ROLE windmill_user WITH NOLOGIN;
+         END IF;
+         GRANT windmill_admin TO windmill_owner_user;
+         GRANT windmill_user TO windmill_owner_user;
+       END $$;"
+  changed_when: false

@@ -109,11 +109,12 @@ geoapi:
         hosts:
           - "{{ geoapi_host }}"
 
-# `processes` is the job-submission API surface. It normally hands jobs off to
-# Windmill for execution; we don't run Windmill in civitas (out of scope per
-# the addon spec), so any endpoint that submits/inspects a Windmill job will
-# 500. The READ side (DuckLake catalog metadata, process listing) works.
-# Wire it to the same Postgres / MinIO / Keycloak / CA bundle as geoapi.
+# `processes` is the job-submission API surface. It hands jobs to Windmill
+# (`goat-windmill-server` in-cluster). WINDMILL_TOKEN is provisioned by
+# 06_windmill.yml into the K8s Secret `windmill-token`; we reference it
+# below with `optional: true` so pods come up before the bootstrap Job runs
+# on first install, then pick it up via the rollout-restart 06 triggers.
+# Wire the rest to the same Postgres / MinIO / Keycloak / CA bundle as geoapi.
 processes:
   enabled: true
   config:
@@ -134,10 +135,8 @@ processes:
     S3_BUCKET_NAME: "{{ goat_addon.minio.bucket }}"
     DUCKLAKE_S3_ENDPOINT: "minio.{{ goat_addon.namespace }}.svc.cluster.local:9000"
     DUCKLAKE_S3_BUCKET: "{{ goat_addon.minio.bucket }}"
-    # Windmill not deployed — explicit stub so misuse fails loudly rather than
-    # quietly hitting the chart default `http://windmill-server:8000`.
-    WINDMILL_URL: "http://windmill-disabled.invalid"
-    WINDMILL_WORKSPACE: "goat"
+    WINDMILL_URL: "http://goat-windmill-server"
+    WINDMILL_WORKSPACE: "{{ goat_addon.windmill.workspace }}"
   extraEnv:
     - name: REQUESTS_CA_BUNDLE
       value: /etc/ssl/civitas/ca.crt
@@ -155,6 +154,12 @@ processes:
     - name: DUCKLAKE_S3_SECRET_KEY
       valueFrom:
         secretKeyRef: { name: minio-credentials, key: secret_key }
+    - name: WINDMILL_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: windmill-token
+          key: token
+          optional: true
   extraVolumes:
     - name: civitas-ca
       configMap:
@@ -263,13 +268,34 @@ postgresql:
 redis:
   enabled: true          # bundled — light dep, fine inside civitas
 
-# Windmill stays off (no demand yet, and would need its own Postgres user
-# provisioning).
+# Windmill: server + the lightweight `default` worker. `print`/`tools`/
+# `workflows` workers stay off — they require tainted `node.kubernetes.io/
+# server-usage: geodata` nodes + 200Gi PVCs that local civitas clusters
+# don't have. Bootstrapped (workspace + API token) by 06_windmill.yml.
+#
+# Dedicated `windmill` database provisioned by 01b_windmill_db.yml — we do
+# NOT share the goat DB (windmill's migrations write ~100 tables and need
+# role-creation privileges the goat user doesn't have).
 windmill:
+  db:
+    reuseGoatConnection: false
+    external:
+      host: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
+      port: 5432
+      database: windmill
+      existingSecret: windmill-postgres-creds
+      existingSecretUserKey: username
+      existingSecretPasswordKey: password
   server:
-    enabled: false
+    enabled: true
   workers:
     default:
+      enabled: true
+    print:
+      enabled: false
+    tools:
+      enabled: false
+    workflows:
       enabled: false
 
 caddy:

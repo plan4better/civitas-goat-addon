@@ -25,6 +25,10 @@
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/01_db.yml"
   tags: ["goat_addon"]
 
+- name: GOAT addon — provision windmill DB
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/01b_windmill_db.yml"
+  tags: ["goat_addon"]
+
 - name: GOAT addon — deploy MinIO + bucket
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/05_minio.yml"
   tags: ["goat_addon"]
@@ -35,6 +39,10 @@
 
 - name: GOAT addon — helm install
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/03_helm_install.yml"
+  tags: ["goat_addon"]
+
+- name: GOAT addon — bootstrap windmill (workspace + token)
+  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/06_windmill.yml"
   tags: ["goat_addon"]
 
 - name: GOAT addon — health check
