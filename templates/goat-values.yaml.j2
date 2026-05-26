@@ -291,6 +291,11 @@ windmill:
       existingSecret: windmill-postgres-creds
       existingSecretUserKey: username
       existingSecretPasswordKey: password
+  # Sync goatlib's bundled tools + tasks into the workspace on each install.
+  # Uses the `windmill-worker-tools` image (~larger than python:3.11-slim);
+  # acceptable since it runs as a one-shot post-install hook.
+  scriptSync:
+    enabled: true
   server:
     enabled: true
     # BASE_URL drives windmill's outbound links (emails, webhooks, the
