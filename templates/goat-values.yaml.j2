@@ -59,7 +59,7 @@ geoapi:
     # goat-core (goat-postgres-creds → goat user). Same DB, separate schema.
     POSTGRES_SERVER: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
     POSTGRES_PORT: "5432"
-    POSTGRES_DB: "{{ goat_addon.db.name }}"
+    POSTGRES_DB: "{{ goat_addon.db.goat_db_name }}"
     DUCKLAKE_CATALOG_SCHEMA: "ducklake"
     # DATA_PATH for the DuckLake ATTACH. Must match what 05_minio.yml passed
     # to the ducklake-init Job. Upstream compose keeps this as a LOCAL path
@@ -124,7 +124,7 @@ processes:
     REALM_NAME: "{{ inv_access.tenant.realm_name }}"
     POSTGRES_SERVER: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
     POSTGRES_PORT: "5432"
-    POSTGRES_DB: "{{ goat_addon.db.name }}"
+    POSTGRES_DB: "{{ goat_addon.db.goat_db_name }}"
     DUCKLAKE_CATALOG_SCHEMA: "ducklake"
     DUCKLAKE_DATA_DIR: "/app/data/ducklake"
     # processes' config.py declares BOTH S3_* (boto3-style) AND DUCKLAKE_S3_*
@@ -259,7 +259,7 @@ postgresql:
   external:
     host: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
     port: 5432
-    database: "{{ goat_addon.db.name }}"
+    database: "{{ goat_addon.db.goat_db_name }}"
     existingSecret: goat-postgres-creds
     existingSecretUserKey: username
     existingSecretPasswordKey: password
@@ -282,7 +282,7 @@ windmill:
     external:
       host: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
       port: 5432
-      database: windmill
+      database: "{{ goat_addon.db.windmill_db_name }}"
       existingSecret: windmill-postgres-creds
       existingSecretUserKey: username
       existingSecretPasswordKey: password

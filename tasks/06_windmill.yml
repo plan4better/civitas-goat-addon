@@ -89,18 +89,18 @@
               sys.exit(f"login failed: {session!r}")
           print("logged in", file=sys.stderr)
 
-          # 3. Create workspace (ignore "already exists")
+          # 3. Create workspace (idempotent: ignore "already exists")
           try:
-              exists = api("/workspaces/exists", method="POST",
-                           body={"id": WS}, token=session)
-              if not exists.get("exists"):
-                  api("/workspaces/create", method="POST",
-                      body={"id": WS, "name": WS}, token=session)
-                  print(f"created workspace: {WS}", file=sys.stderr)
-              else:
-                  print(f"workspace exists: {WS}", file=sys.stderr)
+              api("/workspaces/create", method="POST",
+                  body={"id": WS, "name": WS}, token=session,
+                  json_resp=False)
+              print(f"created workspace: {WS}", file=sys.stderr)
           except Exception as e:
-              print(f"workspace step warning: {e}", file=sys.stderr)
+              # Server responds 400 with "Workspace already exists" body —
+              # don't try to parse, just treat any failure as "exists or
+              # benign" and move on. The token-mint below will fail loudly
+              # if the workspace is genuinely missing.
+              print(f"workspace create skipped: {e}", file=sys.stderr)
 
           # 4. Mint a non-expiring API token
           token = api("/users/tokens/create", method="POST",
@@ -120,6 +120,17 @@
     name: windmill-init
     namespace: "{{ goat_addon.namespace }}"
     wait: true
+
+# `kubernetes.core.k8s` Job-deletion cascades to the Pod by default, but Jobs
+# from earlier addon runs can leave orphaned pods that linger past the new
+# Job's `ttlSecondsAfterFinished`. Reap them explicitly so the token grabber
+# below only sees the current run's pod.
+- name: "GOAT addon: reap orphaned windmill-init pods"
+  ansible.builtin.command:
+    cmd: >-
+      kubectl -n {{ goat_addon.namespace }} delete pod
+      -l job-name=windmill-init --ignore-not-found
+  changed_when: false
 
 - name: "GOAT addon: run windmill bootstrap Job"
   kubernetes.core.k8s:
@@ -171,10 +182,14 @@
     wait_timeout: 180
 
 - name: "GOAT addon: capture windmill token from Job pod logs"
-  ansible.builtin.command:
+  # Pipe `kubectl logs --tail=1 -l job-name=...` through `tail -1` to handle
+  # the case where multiple pods exist for the same job (succeeded pods are
+  # GC'd lazily) — we want the LAST line only, which corresponds to the most
+  # recent pod's final stdout (the printed token).
+  ansible.builtin.shell:
     cmd: >-
       kubectl -n {{ goat_addon.namespace }} logs
-      -l job-name=windmill-init --tail=1
+      -l job-name=windmill-init --tail=1 --prefix=false | tail -1
   register: windmill_token_log
   changed_when: false
 

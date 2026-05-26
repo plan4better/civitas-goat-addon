@@ -6,9 +6,15 @@ goat_addon:
     ref: "{{ inv_addons.goat.chart.ref | default('oci://ghcr.io/plan4better/charts/goat') }}"
     version: "{{ inv_addons.goat.chart.version | default('0.3.2') }}"
   db:
-    name: "{{ inv_addons.goat.db.db_name | default('goat') }}"
     central_db_ns: "{{ inv_central_db.ns_name }}"
     central_db_name: "central-db"
+    # DB names. Defaults match upstream compose / chart conventions. Vary if
+    # you need to co-tenant two installs in the same Postgres cluster — but
+    # note windmill's *role names* (windmill_admin, windmill_user) are
+    # hardcoded by its migrations regardless of DB name, so two installs
+    # sharing one cluster would still collide on roles.
+    goat_db_name: "{{ inv_addons.goat.db.goat_db_name | default('goat') }}"
+    windmill_db_name: "{{ inv_addons.goat.db.windmill_db_name | default('windmill') }}"
   keycloak:
     # Client ID created in the civitas Keycloak realm. Defaults to `goat-web`,
     # matching the convention used by plan4better's standalone infra.

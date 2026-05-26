@@ -1,25 +1,43 @@
 # /home/p4b/civitas-goat-addon/tasks/01_db.yml
 ---
-# Patch the civitas central-db Cluster CR to add a `goat` prepared database.
-# The Zalando postgres-operator's `preparedDatabases.defaultUsers: true`
-# auto-creates:
-#   - goat_owner, goat_reader, goat_writer PostgreSQL users
-#   - K8s Secrets named goat-owner-user.<cluster>.credentials.postgresql.acid.zalan.do
-#                       goat-reader-user.<cluster>...
-#                       goat-writer-user.<cluster>...
+# Patch the civitas central-db Cluster CR to add two prepared databases:
+#   - goat_addon.db.goat_db_name      (default: "goat")     — goat-core/geoapi/processes
+#   - goat_addon.db.windmill_db_name  (default: "windmill") — windmill server + workers
+#
+# Zalando's `preparedDatabases.defaultUsers: true` per-DB auto-creates:
+#   - <db>_owner, <db>_reader, <db>_writer Postgres roles (named after the DB)
+#   - K8s Secrets named <db>-{owner,reader,writer}-user.<cluster>.credentials...
+#
+# Windmill is extra-fussy:
+#   - Its migrations expect role `windmill_admin` (and `windmill_user`) to
+#     pre-exist — first migration does `GRANT ... TO windmill_admin`. These
+#     role names are HARDCODED by windmill regardless of the DB name.
+#   - It runs queries with `SET ROLE windmill_admin`; that role must inherit
+#     the table-level grants its migrations issue to windmill_user.
+#   - Its sqlx pool's runtime queries don't follow Zalando's per-DB
+#     search_path override (`"$user", data`); they assume `public`. So we
+#     suppress Zalando's default-`data`-schema creation
+#     (`schemas: public: defaultRoles: false`) and pin the owner role's
+#     in-DB search_path to `public`.
 
-- name: Build goat preparedDatabases patch
-  # Ansible does NOT evaluate Jinja2 expressions inside YAML dict KEYS.
-  # Building the dict as a single Jinja2 expression where the key is a
-  # variable reference is the workaround that actually works.
+# Ansible doesn't evaluate Jinja inside YAML dict KEYS — naively writing
+# `{{ goat_addon.db.goat_db_name }}: { ... }` produces a literal placeholder
+# key. Build the dict via a single Jinja expression in set_fact instead.
+- name: Build preparedDatabases patch
   ansible.builtin.set_fact:
     goat_prepared_db_patch: >-
-      {{ {goat_addon.db.name: {
+      {{ {
+        goat_addon.db.goat_db_name: {
           'defaultUsers': true,
           'extensions': {'postgis': 'public', 'postgis_topology': 'topology'}
-        }} }}
+        },
+        goat_addon.db.windmill_db_name: {
+          'defaultUsers': true,
+          'schemas': {'public': {'defaultRoles': false}}
+        }
+      } }}
 
-- name: Patch civitas central-db with goat prepared database
+- name: Patch civitas central-db with prepared databases
   kubernetes.core.k8s:
     state: present
     kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
@@ -39,13 +57,25 @@
     api_version: v1
     kind: Secret
     namespace: "{{ goat_addon.db.central_db_ns }}"
-    name: "{{ goat_addon.db.name }}-owner-user.{{ goat_addon.db.central_db_name }}.credentials.postgresql.acid.zalan.do"
+    name: "{{ goat_addon.db.goat_db_name }}-owner-user.{{ goat_addon.db.central_db_name }}.credentials.postgresql.acid.zalan.do"
   register: goat_db_secret
   retries: 30
   delay: 5
   until: goat_db_secret.resources | length > 0
 
-- name: Copy goat owner-user secret into the goat namespace
+- name: Wait for windmill owner-user secret to be created by postgres-operator
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    name: "{{ goat_addon.db.windmill_db_name }}-owner-user.{{ goat_addon.db.central_db_name }}.credentials.postgresql.acid.zalan.do"
+  register: windmill_db_secret
+  retries: 30
+  delay: 5
+  until: windmill_db_secret.resources | length > 0
+
+- name: Copy DB owner-user secrets into the goat namespace
   kubernetes.core.k8s:
     state: present
     kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
@@ -53,11 +83,73 @@
       apiVersion: v1
       kind: Secret
       metadata:
-        name: goat-postgres-creds
+        name: "{{ item.k8s_secret_name }}"
         namespace: "{{ goat_addon.namespace }}"
         labels:
           app.kubernetes.io/managed-by: civitas-goat-addon
       type: Opaque
       data:
-        username: "{{ goat_db_secret.resources[0].data.username }}"
-        password: "{{ goat_db_secret.resources[0].data.password }}"
+        username: "{{ item.zalando_secret.resources[0].data.username }}"
+        password: "{{ item.zalando_secret.resources[0].data.password }}"
+  loop:
+    - k8s_secret_name: goat-postgres-creds
+      zalando_secret: "{{ goat_db_secret }}"
+    - k8s_secret_name: windmill-postgres-creds
+      zalando_secret: "{{ windmill_db_secret }}"
+  loop_control:
+    label: "{{ item.k8s_secret_name }}"
+
+- name: Find central-db primary pod
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ KUBECONFIG | default(lookup('env', 'KUBECONFIG')) | default(lookup('env', 'HOME') + '/.kube/config') }}"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    label_selectors:
+      - "application=spilo"
+      - "spilo-role=master"
+  register: central_db_master
+
+# Zalando creates the owner-user secret before the database is reachable
+# sometimes. Wait until psql can connect to the windmill DB before granting.
+- name: Wait for windmill database to be queryable
+  ansible.builtin.command:
+    cmd: >-
+      kubectl -n {{ goat_addon.db.central_db_ns }}
+      exec {{ central_db_master.resources[0].metadata.name }} -c postgres --
+      psql -U postgres -d {{ goat_addon.db.windmill_db_name }} -tc "SELECT 1"
+  register: windmill_db_ping
+  changed_when: false
+  retries: 30
+  delay: 5
+  until: windmill_db_ping.rc == 0
+
+- name: "Set up windmill prereqs (roles, search_path, drop stray `data` schema)"
+  ansible.builtin.command:
+    # NB: the role names `windmill_admin` and `windmill_user` are HARDCODED by
+    # windmill's own migrations — they don't follow the DB name. The
+    # Zalando-derived `<db>_owner_user` does follow the DB name, hence the
+    # variable interpolation in the final GRANT.
+    cmd: >-
+      kubectl -n {{ goat_addon.db.central_db_ns }}
+      exec {{ central_db_master.resources[0].metadata.name }} -c postgres --
+      psql -U postgres -d {{ goat_addon.db.windmill_db_name }} -v ON_ERROR_STOP=1 -c
+      "DO $$ BEGIN
+         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'windmill_admin') THEN
+           CREATE ROLE windmill_admin WITH NOLOGIN BYPASSRLS;
+         ELSE
+           ALTER ROLE windmill_admin BYPASSRLS;
+         END IF;
+         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'windmill_user') THEN
+           CREATE ROLE windmill_user WITH NOLOGIN;
+         END IF;
+         -- windmill runs queries with SET ROLE windmill_admin; admin must
+         -- inherit windmill_user's table-level grants from the migrations.
+         GRANT windmill_user TO windmill_admin;
+         GRANT windmill_admin TO {{ goat_addon.db.windmill_db_name }}_owner_user;
+         GRANT windmill_user  TO {{ goat_addon.db.windmill_db_name }}_owner_user;
+       END $$;
+       ALTER ROLE {{ goat_addon.db.windmill_db_name }}_owner_user IN DATABASE {{ goat_addon.db.windmill_db_name }} SET search_path = public;
+       ALTER DATABASE {{ goat_addon.db.windmill_db_name }} SET search_path = public;
+       DROP SCHEMA IF EXISTS data CASCADE;"
+  changed_when: false

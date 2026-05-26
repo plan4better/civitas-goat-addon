@@ -298,7 +298,7 @@
                     valueFrom:
                       secretKeyRef: { name: goat-postgres-creds, key: password }
                   - name: PG_DB
-                    value: "{{ goat_addon.db.name }}"
+                    value: "{{ goat_addon.db.goat_db_name }}"
                   - name: S3_ENDPOINT
                     value: "minio.{{ goat_addon.namespace }}.svc.cluster.local:9000"
                   - name: S3_KEY

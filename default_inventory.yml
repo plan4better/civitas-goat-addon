@@ -6,10 +6,16 @@ inv_addons:
     namespace: "{{ ENVIRONMENT }}-goat-stack"
     chart:
       ref: "oci://ghcr.io/plan4better/charts/goat"
-      version: "0.3.0"
+      version: "0.3.2"
     db:
-      reuse_central: true
-      db_name: goat
+      # Postgres database names. Defaults match upstream conventions.
+      # Override only if you need to co-tenant multiple goat installs in
+      # one Postgres cluster — note that windmill's *role* names
+      # (windmill_admin, windmill_user) are hardcoded by its migrations
+      # regardless of DB name, so two installs sharing one cluster would
+      # still collide on those roles.
+      goat_db_name: "goat"
+      windmill_db_name: "windmill"
     keycloak:
       # The OIDC client ID to create in the civitas Keycloak realm.
       # The realm itself is read from inv_access.tenant.realm_name.

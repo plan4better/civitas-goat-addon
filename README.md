@@ -26,10 +26,15 @@ inv_addons:
     namespace: "{{ ENVIRONMENT }}-goat-stack"
     chart:
       ref: "oci://ghcr.io/plan4better/charts/goat"
-      version: "0.3.0"
+      version: "0.3.2"
     db:
-      reuse_central: true
-      db_name: goat
+      # Optional — Postgres database names. Defaults shown.
+      # Override only if you need to co-tenant multiple goat installs in
+      # one Postgres cluster. NB windmill's *role* names (windmill_admin,
+      # windmill_user) are hardcoded by its migrations regardless, so the
+      # decoupling is partial.
+      goat_db_name: "goat"
+      windmill_db_name: "windmill"
     keycloak:
       # The OIDC client ID to create in the civitas Keycloak realm.
       # The realm itself is read from inv_access.tenant.realm_name.
@@ -97,7 +102,12 @@ Addon version is independent of civitas-core's. Tag the addon based on its own s
   kubectl -n cc-loc-operation-stack delete pod -l app.kubernetes.io/name=postgres-operator
   ```
 
-- **Ansible Jinja2 in dict keys**: `01_db.yml` uses a `set_fact` + Jinja dict-literal pattern because Ansible does not evaluate Jinja inside YAML dict keys. Don't naively refactor to the more obvious form — it silently produces a literal `{{ goat_addon.db.name }}` key in the patched `postgresql.acid.zalan.do` CR.
+- **Ansible Jinja2 in dict keys**: if you ever need to add a third
+  `preparedDatabases` entry with a name derived from a variable, you'll find
+  Ansible does NOT evaluate Jinja inside YAML dict keys. The workaround is a
+  `set_fact` + a single Jinja dict-literal expression
+  (`{{ {varname: {...}} }}`). `01_db.yml` used this for the `goat` key before
+  both keys were hardcoded to literal `goat` + `windmill`.
 
 - **`storage_class` is a dict, not a string**: civitas-core's `inv_k8s.storage_class` is `{loc, rwo, rwx}`. The chart wants a single string; the rendered values file picks `loc` by default. Override `inv_k8s.storage_class.loc` (or modify `templates/goat-values.yaml.j2` in a fork) for multi-node setups that need `rwx` storage.
 

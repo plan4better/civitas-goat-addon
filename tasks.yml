@@ -21,12 +21,8 @@
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/00_namespace.yml"
   tags: ["goat_addon"]
 
-- name: GOAT addon — provision DB user
+- name: GOAT addon — provision DB users (goat + windmill)
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/01_db.yml"
-  tags: ["goat_addon"]
-
-- name: GOAT addon — provision windmill DB
-  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/01b_windmill_db.yml"
   tags: ["goat_addon"]
 
 - name: GOAT addon — deploy MinIO + bucket
