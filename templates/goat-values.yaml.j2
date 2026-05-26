@@ -137,7 +137,8 @@ processes:
     DUCKLAKE_S3_ENDPOINT: "minio.{{ goat_addon.namespace }}.svc.cluster.local:9000"
     DUCKLAKE_S3_BUCKET: "{{ goat_addon.minio.bucket }}"
     WINDMILL_URL: "http://goat-windmill-server"
-    WINDMILL_WORKSPACE: "{{ goat_addon.windmill.workspace }}"
+    # Must match chart's `windmill.bootstrap.workspace` (default `goat`).
+    WINDMILL_WORKSPACE: "goat"
   extraEnv:
     - name: REQUESTS_CA_BUNDLE
       value: /etc/ssl/civitas/ca.crt
@@ -155,10 +156,13 @@ processes:
     - name: DUCKLAKE_S3_SECRET_KEY
       valueFrom:
         secretKeyRef: { name: minio-credentials, key: secret_key }
+    # Bootstrapped by the chart's post-install hook (since chart v0.3.4)
+    # into K8s Secret `<release>-windmill-token`. `optional: true` lets
+    # processes pods come up before the hook finishes on first install.
     - name: WINDMILL_TOKEN
       valueFrom:
         secretKeyRef:
-          name: windmill-token
+          name: goat-windmill-token
           key: token
           optional: true
   extraVolumes:

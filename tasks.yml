@@ -37,9 +37,10 @@
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/03_helm_install.yml"
   tags: ["goat_addon"]
 
-- name: GOAT addon — bootstrap windmill (workspace + token)
-  ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/06_windmill.yml"
-  tags: ["goat_addon"]
+# Windmill bootstrap (workspace + admin password rotation + token mint) is
+# done by the chart itself as a post-install hook since v0.3.4 — the chart
+# writes the token to K8s Secret `<release>-windmill-token` which
+# goat-values.yaml.j2 wires into the processes deployment.
 
 - name: GOAT addon — health check
   ansible.builtin.import_tasks: "{{ playbook_dir }}/addons/goat_addon/tasks/99_health_check.yml"
