@@ -4,7 +4,7 @@ goat_addon:
   namespace: "{{ inv_addons.goat.namespace | default(ENVIRONMENT + '-goat-stack') }}"
   chart:
     ref: "{{ inv_addons.goat.chart.ref | default('oci://ghcr.io/plan4better/charts/goat') }}"
-    version: "{{ inv_addons.goat.chart.version | default('0.3.2') }}"
+    version: "{{ inv_addons.goat.chart.version | default('0.3.3') }}"
   db:
     central_db_ns: "{{ inv_central_db.ns_name }}"
     central_db_name: "central-db"

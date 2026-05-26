@@ -7,6 +7,7 @@
 {%- set core_host = 'core.' + goat_host %}
 {%- set geoapi_host = 'geoapi.' + goat_host %}
 {%- set processes_host = 'processes.' + goat_host %}
+{%- set windmill_host = 'windmill.' + goat_host %}
 
 global:
   # inv_k8s.storage_class is a DICT in civitas-core ({loc, rwo, rwx}); the
@@ -288,6 +289,28 @@ windmill:
       existingSecretPasswordKey: password
   server:
     enabled: true
+    # BASE_URL drives windmill's outbound links (emails, webhooks, the
+    # `Open in Windmill` button). Set it to the public URL so links work
+    # outside the cluster.
+    config:
+      MODE: "server"
+      BASE_URL: "https://{{ windmill_host }}"
+    ingress:
+      enabled: true
+      className: "{{ inv_k8s.ingress_class }}"
+      annotations:
+        cert-manager.io/cluster-issuer: "{{ inv_k8s.cert_manager.issuer_name }}"
+        kubernetes.io/ingress.class: "{{ inv_k8s.ingress_class }}"
+        nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      hosts:
+        - host: "{{ windmill_host }}"
+          paths:
+            - path: /
+              pathType: Prefix
+      tls:
+        - secretName: "goat-windmill-server-{{ DOMAIN }}-tls"
+          hosts:
+            - "{{ windmill_host }}"
   workers:
     default:
       enabled: true
