@@ -1,26 +1,51 @@
-# /home/p4b/civitas-goat-addon/default_inventory.yml
+# Only keys practically every deployment sets. Defaults live in
+# vars/default.yml; schema details in the README.
 ---
 inv_addons:
   goat:
     enable: true
-    namespace: "{{ ENVIRONMENT }}-goat-stack"
-    chart:
-      ref: "oci://ghcr.io/plan4better/charts/goat"
-      version: "0.4.1"
-    db:
-      # Postgres database names. Defaults match upstream conventions.
-      # Override only if you need to co-tenant multiple goat installs in
-      # one Postgres cluster — note that windmill's *role* names
-      # (windmill_admin, windmill_user) are hardcoded by its migrations
-      # regardless of DB name, so two installs sharing one cluster would
-      # still collide on those roles.
-      goat_db_name: "goat"
-      windmill_db_name: "windmill"
-    keycloak:
-      # The OIDC client ID to create in the civitas Keycloak realm.
-      # The realm itself is read from inv_access.tenant.realm_name.
-      client_id: "goat-web"
+    # One pin for every plan4better/goat image.
+    release: "v2.4.60"
     web:
-      # Public-facing URL of the goat-web frontend. Used to set Keycloak
-      # redirect URIs and the NextAuth NEXTAUTH_URL env var.
-      public_url: "https://goat.{{ DOMAIN }}"
+      subdomain: "goat"
+      # public_url: "https://goat.{{ DOMAIN }}"
+    s3:
+      # in_cluster: addon-deployed single-replica MinIO.
+      # external:   existing S3-compatible endpoint (set endpoint + credentials).
+      mode: "in_cluster"
+      endpoint: ""
+      access_key: ""
+      secret_key: ""
+      # bucket: "goat"
+      # region: "us-east-1"
+      # provider: "aws"
+      # force_path_style: false
+      # proxy:
+      #   max_body_size: "5g"
+      #   ssl_name: "s3.example.com"
+      #   upstream_vhost: ""
+    # namespace: "{{ ENVIRONMENT }}-goat-stack"
+    # chart:                        # OCI pull from ghcr.io by default; override
+    #                               # ref to a local tgz for offline installs
+    #   ref: "oci://ghcr.io/plan4better/charts/goat"
+    #   version: "0.4.1"
+    # db:
+    #   goat_db_name: "goat"
+    #   windmill_db_name: "windmill"
+    #   # Runtime Postgres endpoint. Defaults to the Zalando master
+    #   # service; override to route workloads elsewhere.
+    #   host: "central-db.{{ inv_central_db.ns_name }}.svc.cluster.local"
+    #   port: 5432
+    #   # Per-service overrides, default to `host`/`port`.
+    #   windmill_host: "central-db.{{ inv_central_db.ns_name }}.svc.cluster.local"
+    #   windmill_port: 5432
+    #   geoapi_host: "central-db.{{ inv_central_db.ns_name }}.svc.cluster.local"
+    #   geoapi_port: 5432
+    # keycloak:
+    #   client_id: "goat-web"
+    # ducklake:
+    #   pvc_size: "20Gi"
+    #   pvc_access_mode: "ReadWriteOnce"
+    #   storage_class: "nfs-client"
+    # ingress:
+    #   traefik_api_group: "traefik.containo.us/v1alpha1"   # Traefik v2

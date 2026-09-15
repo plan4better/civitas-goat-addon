@@ -1,24 +1,15 @@
-# /home/p4b/civitas-goat-addon/tasks/05_minio.yml
 ---
-# geoapi (and the chart's `processes` service when enabled) need S3-compatible
-# object storage to back the DuckLake data files. The GOAT chart doesn't ship
-# MinIO yet (planned for chart Phase 2/3 per Chart.yaml), and civitas-core
-# doesn't have a cluster-wide object store either. So we run a minimal
-# single-replica MinIO inside the goat namespace, with a bucket-create Job.
-#
-# Mirrors plan4better's compose.yaml topology (quay.io/minio images).
-# Single-replica + PVC = fine for local/dev; not HA, not for prod scale.
+# Object storage + DuckLake volume. `goat_addon.s3.mode` selects:
+#   in_cluster: single-replica MinIO deployed here (mirrors
+#               plan4better's compose topology; not HA).
+#   external:   MinIO-server blocks and the bucket-init Job are
+#               skipped — external credentials typically lack
+#               s3:CreateBucket and the bucket is provisioned
+#               out-of-band.
 
-# Shared DuckLake data volume. layer_import (worker-tools) writes parquet
-# under /app/data/ducklake/...; geoapi reads it for tile serving. Both must
-# see the same files — hence one PVC mounted on tools/workflows/geoapi via
-# the chart's existingClaim wiring + extraVolumes (goat_values.yml).
-#
-# Storage class: inv_k8s.storage_class.rwx — production clusters set this to
-# a real RWX class (NFS / Longhorn). Civitas's default `local-path` is
-# RWO-only; multi-pod sharing relies on all data-touching pods co-scheduling
-# on the same node (see README "Known caveats"). Switch the operator's
-# storage class for production HA.
+# Shared DuckLake volume: workflows write parquet under /app/data/
+# ducklake, geoapi reads it. Mounted on tools/workflows/geoapi via
+# existingClaim + extraVolumes in goat_values.yml.
 - name: "GOAT addon: create shared DuckLake data PVC"
   kubernetes.core.k8s:
     state: present
@@ -34,38 +25,75 @@
           app.kubernetes.io/managed-by: civitas-goat-addon
       spec:
         accessModes:
-          # RWX for real multi-node clusters; local-path (k3d/k3s default)
-          # cannot provision RWX — set pvc_access_mode: ReadWriteOnce there
-          # (sharing then relies on co-scheduling, see README).
           - "{{ goat_addon.ducklake.pvc_access_mode | default('ReadWriteMany') }}"
-        storageClassName: "{{ inv_k8s.storage_class.rwx }}"
+        storageClassName: "{{ goat_addon.ducklake.storage_class }}"
         resources:
           requests:
             storage: "{{ goat_addon.ducklake.pvc_size | default('20Gi') }}"
 
-- name: "GOAT addon: generate or reuse MinIO root credentials"
+- name: "GOAT addon: preflight — s3.mode is supported"
+  ansible.builtin.assert:
+    that:
+      - goat_addon.s3.mode in ['in_cluster', 'external']
+    fail_msg: >-
+      goat_addon.s3.mode = '{{ goat_addon.s3.mode }}' but must be one of
+      'in_cluster' or 'external'. See vars/default.yml.
+
+- name: "GOAT addon: preflight — external S3 endpoint config"
+  ansible.builtin.assert:
+    that:
+      - goat_addon.s3.endpoint | length > 0
+    fail_msg: >-
+      goat_addon.s3.mode = 'external' but endpoint is empty. Set
+      inv_addons.goat.s3.endpoint to the cluster-internal S3 URL.
+  when: goat_addon.s3.mode == 'external'
+
+- name: "GOAT addon: preflight — external S3 credentials provided"
+  ansible.builtin.assert:
+    that:
+      - goat_addon.s3.access_key | length > 0
+      - goat_addon.s3.secret_key | length > 0
+    fail_msg: >-
+      goat_addon.s3.mode = 'external' but access_key/secret_key are
+      empty. Set inv_addons.goat.s3.access_key / secret_key (source them
+      from ansible-vault).
+  when: goat_addon.s3.mode == 'external'
+
+# in_cluster: reuse existing credentials on rerun if the Secret is present.
+- name: "GOAT addon: check for existing goat-s3-credentials secret"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: v1
+    kind: Secret
+    name: goat-s3-credentials
+    namespace: "{{ goat_addon.namespace }}"
+  register: minio_existing
+  when: goat_addon.s3.mode == 'in_cluster'
+
+- name: "GOAT addon: resolve MinIO root credentials"
   block:
-    - name: "GOAT addon: check for existing minio-credentials secret"
-      kubernetes.core.k8s_info:
-        kubeconfig: "{{ k8s_config }}"
-        context: "{{ k8s_context }}"
-        api_version: v1
-        kind: Secret
-        name: minio-credentials
-        namespace: "{{ goat_addon.namespace }}"
-      register: minio_existing
+    - name: "GOAT addon: use externally-provided S3 credentials"
+      ansible.builtin.set_fact:
+        minio_access_key: "{{ goat_addon.s3.access_key }}"
+        minio_secret_key: "{{ goat_addon.s3.secret_key }}"
+      when: goat_addon.s3.mode == 'external'
 
     - name: "GOAT addon: reuse existing MinIO credentials"
       ansible.builtin.set_fact:
         minio_access_key: "{{ minio_existing.resources[0].data.access_key | b64decode }}"
         minio_secret_key: "{{ minio_existing.resources[0].data.secret_key | b64decode }}"
-      when: minio_existing.resources | length > 0
+      when:
+        - goat_addon.s3.mode == 'in_cluster'
+        - minio_existing.resources | length > 0
 
     - name: "GOAT addon: generate new MinIO credentials"
       ansible.builtin.set_fact:
         minio_access_key: "goat-{{ lookup('community.general.random_string', length=12, special=false) | lower }}"
         minio_secret_key: "{{ lookup('community.general.random_string', length=40, special=false) }}"
-      when: minio_existing.resources | length == 0
+      when:
+        - goat_addon.s3.mode == 'in_cluster'
+        - minio_existing.resources | length == 0
 
 - name: "GOAT addon: persist MinIO credentials secret"
   kubernetes.core.k8s:
@@ -76,7 +104,7 @@
       apiVersion: v1
       kind: Secret
       metadata:
-        name: minio-credentials
+        name: goat-s3-credentials
         namespace: "{{ goat_addon.namespace }}"
         labels:
           app.kubernetes.io/managed-by: civitas-goat-addon
@@ -86,6 +114,7 @@
         secret_key: "{{ minio_secret_key }}"
 
 - name: "GOAT addon: deploy MinIO (server + PVC + service)"
+  when: goat_addon.s3.mode == 'in_cluster'
   kubernetes.core.k8s:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
@@ -114,7 +143,7 @@
       spec:
         replicas: 1
         strategy:
-          type: Recreate  # single-replica + RWO PVC → can't rolling-update
+          type: Recreate  # single-replica + RWO PVC → no rolling update
         selector:
           matchLabels:
             app: minio
@@ -125,8 +154,8 @@
           spec:
             containers:
               - name: minio
-                image: "{{ goat_addon_software.images.minio.registry }}/{{ goat_addon_software.images.minio.repository }}:{{ goat_addon_software.images.minio.tag }}"
-                imagePullPolicy: "{{ goat_addon_software.images.minio.pullPolicy | default('IfNotPresent') }}"
+                image: "{{ software.addon_goat.images.minio.registry }}/{{ software.addon_goat.images.minio.repository }}:{{ software.addon_goat.images.minio.tag }}"
+                imagePullPolicy: "{{ software.addon_goat.images.minio.pullPolicy | default('IfNotPresent') }}"
                 args: ["server", "--console-address", ":9001", "/data/s3"]
                 ports:
                   - { name: api, containerPort: 9000 }
@@ -135,12 +164,12 @@
                   - name: MINIO_ROOT_USER
                     valueFrom:
                       secretKeyRef:
-                        name: minio-credentials
+                        name: goat-s3-credentials
                         key: access_key
                   - name: MINIO_ROOT_PASSWORD
                     valueFrom:
                       secretKeyRef:
-                        name: minio-credentials
+                        name: goat-s3-credentials
                         key: secret_key
                 readinessProbe:
                   httpGet: { path: /minio/health/ready, port: 9000 }
@@ -163,11 +192,108 @@
           - { name: api, port: 9000, targetPort: 9000 }
           - { name: console, port: 9001, targetPort: 9001 }
 
-# Expose MinIO over HTTPS for browser-side uploads. Goat-core returns
-# presigned S3 URLs that the SPA fetches directly — they MUST be HTTPS,
-# or Chrome mixed-content-blocks them. The hostname mirrors the per-service
-# subdomain convention (s3.<goat-host>) and gets a civitas-CA-signed cert
-# via cert-manager so the browser trusts it without prompting.
+# `/<bucket>` ingress path — matches path-style SigV4, no rewrite.
+# Ingress backends must live in the same namespace, so external S3
+# is fronted by an ExternalName Service. Definition passed as a
+# block scalar so the k8s module parses ports as native ints
+# (jinja2 without jinja2_native stringifies ints in inline dicts).
+- name: "GOAT addon: create ExternalName service for external S3"
+  when: goat_addon.s3.mode == 'external'
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    definition: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: goat-s3-upstream
+        namespace: {{ k8s_namespace }}
+        labels:
+          app.kubernetes.io/name: goat
+          app.kubernetes.io/part-of: goat
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      {% if inv_k8s.ingress_class == 'traefik' and (goat_s3_endpoint_is_tls | bool) %}
+        annotations:
+          # Traefik has no Ingress-level backend-protocol annotation;
+          # scheme is per-Service. Internal-CA endpoints additionally
+          # need a ServersTransport CRD — out of scope here.
+          traefik.ingress.kubernetes.io/service.serversscheme: https
+      {% endif %}
+      spec:
+        type: ExternalName
+        externalName: {{ goat_addon.s3.endpoint | urlsplit('hostname') }}
+        ports:
+          - name: api
+            port: {{ goat_s3_upstream_port }}
+            # Explicit: some controllers treat unset targetPort as 0
+            # and fail with `Connection refused` against a healthy upstream.
+            targetPort: {{ goat_s3_upstream_port }}
+
+# Annotations for the MinIO/`<bucket>` Ingress. Broken out from the
+# Ingress definition so nginx-only keys stay conditional.
+#
+# backend-protocol: ingress-nginx defaults to HTTP; sending plaintext
+# to an S3 HTTPS listener resets mid-request (502 to the browser).
+# upstream-vhost:   SigV4 signs the request host — a fronting proxy
+#                   rewriting Host to the internal ingress name breaks
+#                   every presigned GET with SignatureDoesNotMatch.
+# proxy-ssl-name:   Explicit SNI. Default resolves to `upstream_balancer`
+#                   under dynamic upstreams, which no S3 cert covers.
+#
+# `set_fact` preserves the dict type only when the whole value is a
+# single `{{ expr }}` — do NOT use `>-` here.
+- name: "GOAT addon: build MinIO ingress annotations for {{ inv_k8s.ingress_class }}"
+  ansible.builtin.set_fact:
+    minio_ingress_annotations: "{{ minio_base_annotations | combine(minio_nginx_annotations if inv_k8s.ingress_class == 'nginx' else {}) | combine(minio_nginx_vhost_annotation if (inv_k8s.ingress_class == 'nginx' and goat_s3_upstream_vhost | length > 0) else {}) | combine(minio_nginx_tls_annotations if (inv_k8s.ingress_class == 'nginx' and (goat_s3_endpoint_is_tls | bool)) else {}) }}"
+  vars:
+    # cert-manager.io/cluster-issuer intentionally omitted — the
+    # Certificate is owned by 06_certificate.yml; leaving it on made
+    # five reconcilers race for one Secret. kubernetes.io/ingress.class
+    # omitted — deprecated, diverges from spec.ingressClassName.
+    minio_base_annotations: {}
+    minio_nginx_annotations:
+      # civitas convention: clusters terminating TLS at the ingress
+      # redirect; clusters with a fronting proxy skip to avoid a loop.
+      nginx.ingress.kubernetes.io/ssl-redirect: "{{ 'false' if (inv_k8s.ingress.http | default(false)) else 'true' }}"
+      nginx.ingress.kubernetes.io/whitelist-source-range: "{{ user_whitelist | default(['0.0.0.0/0']) | join(',') }}"
+      nginx.ingress.kubernetes.io/proxy-body-size: "{{ goat_addon.s3.proxy.max_body_size }}"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+      # ExternalName has no ClusterIP. Cluster-wide `service-upstream`
+      # would 502 every request looking for one — pin off here.
+      nginx.ingress.kubernetes.io/service-upstream: "false"
+      # Pinned "on" so streaming-configured controllers still surface
+      # early upstream 4xx (bad signature, quota, missing bucket)
+      # instead of nondeterministic 502s.
+      nginx.ingress.kubernetes.io/proxy-request-buffering: "on"
+      nginx.ingress.kubernetes.io/backend-protocol: "{{ 'HTTPS' if (goat_s3_endpoint_is_tls | bool) else 'HTTP' }}"
+    # Split out so `upstream_vhost: ""` can suppress the annotation
+    # entirely (a set-to-empty annotation would blank the Host header).
+    minio_nginx_vhost_annotation:
+      nginx.ingress.kubernetes.io/upstream-vhost: "{{ goat_s3_upstream_vhost }}"
+    minio_nginx_tls_annotations:
+      # No-op unless a `proxy-ssl-secret` (client-CA Secret) is
+      # provisioned separately — the addon does not create one.
+      nginx.ingress.kubernetes.io/proxy-ssl-verify: "{{ 'on' if (goat_addon.s3.proxy.ssl_verify | bool) else 'off' }}"
+      nginx.ingress.kubernetes.io/proxy-ssl-name: "{{ goat_s3_proxy_ssl_name }}"
+      nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
+
+# Kept in a set_fact so the int port stays typed correctly through
+# the k8s module (see comment on the ExternalName Service above).
+- name: "GOAT addon: build MinIO ingress paths"
+  ansible.builtin.set_fact:
+    minio_ingress_paths:
+      - path: "{{ goat_s3_ingress_path }}"
+        pathType: Prefix
+        backend:
+          service:
+            name: "{{ 'minio' if goat_addon.s3.mode == 'in_cluster' else 'goat-s3-upstream' }}"
+            # Named `api` port — both Services expose it, resolves in
+            # either mode without stringifying the int.
+            port:
+              name: api
+
 - name: "GOAT addon: deploy MinIO public ingress (for browser uploads)"
   kubernetes.core.k8s:
     state: present
@@ -179,34 +305,26 @@
       metadata:
         name: minio
         namespace: "{{ goat_addon.namespace }}"
+        # `name` + `part-of` match the chart's four ingresses so
+        # `-l app.kubernetes.io/name=goat` selectors pick this up too.
         labels:
           app.kubernetes.io/managed-by: civitas-goat-addon
-        annotations:
-          cert-manager.io/cluster-issuer: "{{ inv_k8s.cert_manager.issuer_name }}"
-          kubernetes.io/ingress.class: "{{ inv_k8s.ingress_class }}"
-          nginx.ingress.kubernetes.io/ssl-redirect: "true"
-          # Datasets can be large; lift the 1 MB default and the 60s timeout.
-          nginx.ingress.kubernetes.io/proxy-body-size: "5g"
-          nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-          nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+          app.kubernetes.io/name: goat
+          app.kubernetes.io/part-of: goat
+        annotations: "{{ minio_ingress_annotations }}"
       spec:
         ingressClassName: "{{ inv_k8s.ingress_class }}"
         tls:
           - hosts:
-              - "s3.goat.{{ DOMAIN }}"
-            secretName: "minio-s3-{{ DOMAIN }}-tls"
+              - "{{ goat_ingress_host }}"
+            secretName: "{{ goat_tls_secret }}"
         rules:
-          - host: "s3.goat.{{ DOMAIN }}"
+          - host: "{{ goat_ingress_host }}"
             http:
-              paths:
-                - path: /
-                  pathType: Prefix
-                  backend:
-                    service:
-                      name: minio
-                      port: { number: 9000 }
+              paths: "{{ minio_ingress_paths }}"
 
 - name: "GOAT addon: wait for MinIO to be ready"
+  when: goat_addon.s3.mode == 'in_cluster'
   kubernetes.core.k8s_info:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
@@ -220,21 +338,22 @@
       status: "True"
     wait_timeout: 180
 
-# `mc mb` is idempotent — re-running the Job is safe but wastes pod scheduling
-# time. We delete any prior bucket-init Job (Job specs are immutable; can't
-# helm-patch in place) and recreate fresh each addon run.
+# Bucket creation runs in in_cluster mode only. `mc mb` is idempotent;
+# the Job is recreated each run because Job specs are immutable.
 - name: "GOAT addon: clean up prior bucket-init Job"
+  when: goat_addon.s3.mode == 'in_cluster'
   kubernetes.core.k8s:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
     state: absent
     api_version: batch/v1
     kind: Job
-    name: minio-bucket-init
+    name: goat-bucket-init
     namespace: "{{ goat_addon.namespace }}"
     wait: true
 
-- name: "GOAT addon: create goat bucket in MinIO"
+- name: "GOAT addon: create goat bucket in S3"
+  when: goat_addon.s3.mode == 'in_cluster'
   kubernetes.core.k8s:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
@@ -243,7 +362,7 @@
       apiVersion: batch/v1
       kind: Job
       metadata:
-        name: minio-bucket-init
+        name: goat-bucket-init
         namespace: "{{ goat_addon.namespace }}"
         labels:
           app.kubernetes.io/managed-by: civitas-goat-addon
@@ -254,30 +373,33 @@
             restartPolicy: OnFailure
             containers:
               - name: mc
-                image: "{{ goat_addon_software.images.minio_mc.registry }}/{{ goat_addon_software.images.minio_mc.repository }}:{{ goat_addon_software.images.minio_mc.tag }}"
-                imagePullPolicy: "{{ goat_addon_software.images.minio_mc.pullPolicy | default('IfNotPresent') }}"
+                image: "{{ software.addon_goat.images.minio_mc.registry }}/{{ software.addon_goat.images.minio_mc.repository }}:{{ software.addon_goat.images.minio_mc.tag }}"
+                imagePullPolicy: "{{ software.addon_goat.images.minio_mc.pullPolicy | default('IfNotPresent') }}"
                 env:
+                  - name: MC_ENDPOINT
+                    value: "{{ goat_s3_internal_endpoint }}"
                   - name: MC_ACCESS_KEY
                     valueFrom:
-                      secretKeyRef: { name: minio-credentials, key: access_key }
+                      secretKeyRef: { name: goat-s3-credentials, key: access_key }
                   - name: MC_SECRET_KEY
                     valueFrom:
-                      secretKeyRef: { name: minio-credentials, key: secret_key }
+                      secretKeyRef: { name: goat-s3-credentials, key: secret_key }
                 command: ["/bin/sh", "-c"]
                 args:
                   - |
                     set -euo pipefail
-                    mc alias set goat http://minio:9000 "$MC_ACCESS_KEY" "$MC_SECRET_KEY"
-                    mc mb --ignore-existing goat/{{ goat_addon.minio.bucket }}
-                    echo "bucket goat/{{ goat_addon.minio.bucket }} ready"
+                    mc alias set goat "$MC_ENDPOINT" "$MC_ACCESS_KEY" "$MC_SECRET_KEY"
+                    mc mb --ignore-existing goat/{{ goat_addon.s3.bucket }}
+                    echo "bucket goat/{{ goat_addon.s3.bucket }} ready at $MC_ENDPOINT"
 
 - name: "GOAT addon: wait for bucket-init Job to complete"
+  when: goat_addon.s3.mode == 'in_cluster'
   kubernetes.core.k8s_info:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
     api_version: batch/v1
     kind: Job
-    name: minio-bucket-init
+    name: goat-bucket-init
     namespace: "{{ goat_addon.namespace }}"
     wait: true
     wait_condition:
@@ -285,12 +407,15 @@
       status: "True"
     wait_timeout: 120
 
-# DuckLake bootstrap. The chart's `DUCKLAKE_CREATE_IF_NOT_EXISTS` env var is
-# unused dead config — geoapi attaches in READ_ONLY mode and DuckDB refuses
-# to create a missing lake. The lake must already exist before any read-only
-# consumer (geoapi, future processes) starts. A small Python script does the
-# initial ATTACH (read-write, no READ_ONLY flag) which creates the catalog
-# tables in Postgres + the metadata layout in S3.
+# DuckLake bootstrap. The chart's `DUCKLAKE_CREATE_IF_NOT_EXISTS` is
+# unused — geoapi attaches READ_ONLY and DuckDB refuses to create a
+# missing lake. A one-shot ATTACH (RW, no READ_ONLY) creates the
+# catalog tables in Postgres and the metadata layout in S3.
+#
+# Runs from the `processes` image so its DuckDB extension version is
+# the same one every runtime consumer later attaches with; a bare
+# python image + `pip install duckdb==X` decoupled catalog format
+# from runtime and produced `catalog version mismatch` at attach.
 - name: "GOAT addon: fetch goat-postgres-creds for ducklake init"
   kubernetes.core.k8s_info:
     kubeconfig: "{{ k8s_config }}"
@@ -316,46 +441,68 @@
           app.kubernetes.io/managed-by: civitas-goat-addon
       data:
         init.py: |
-          """One-shot DuckLake catalog bootstrap. Read env vars for connection
-          details, then ATTACH the lake in read-write mode so DuckDB creates
-          the catalog schema + S3 layout if missing."""
+          """One-shot DuckLake catalog bootstrap. Runs from the
+          `processes` image so LOAD hits the extensions baked into
+          DUCKDB_EXTENSION_DIRECTORY."""
+
           import os
           import duckdb
+          from goatlib.storage.ducklake import (
+              REQUIRED_DUCKDB_EXTENSIONS,
+              configure_baked_extensions,
+          )
 
           con = duckdb.connect()
-          for ext in ("spatial", "httpfs", "postgres", "ducklake"):
-              con.execute(f"INSTALL {ext}; LOAD {ext};")
+          if not configure_baked_extensions(con):
+              raise RuntimeError(
+                  "DUCKDB_EXTENSION_DIRECTORY unset — refusing to fall back to "
+                  "extensions.duckdb.org from a cluster Job."
+              )
+          print("extension_directory:",
+                con.execute("select current_setting('extension_directory')").fetchone()[0])
+          for ext in REQUIRED_DUCKDB_EXTENSIONS:
+              con.execute(f"LOAD {ext};")
 
           # DuckDB takes the endpoint as host[:port] and the scheme as a flag.
           endpoint = os.environ["S3_ENDPOINT"]
-          use_ssl = endpoint.startswith("https://")
           host = endpoint.split("://", 1)[-1]
           con.execute("SET s3_endpoint = ?;", [host])
           con.execute("SET s3_access_key_id = ?;", [os.environ["S3_KEY"]])
           con.execute("SET s3_secret_access_key = ?;", [os.environ["S3_SECRET"]])
-          con.execute("SET s3_url_style = 'path';")
+          # SET takes literals only, not bind params. Values are
+          # inventory-derived and s3_url_style is whitelisted.
+          url_style = os.environ.get("S3_URL_STYLE", "path")
+          if url_style not in ("path", "vhost"):
+              raise ValueError(
+                  f"S3_URL_STYLE must be 'path' or 'vhost', got: {url_style!r}"
+              )
+          con.execute(f"SET s3_url_style = '{url_style}';")
+          use_ssl = os.environ.get("S3_USE_SSL", "false").lower() == "true"
           con.execute(f"SET s3_use_ssl = {'true' if use_ssl else 'false'};")
 
           pg_uri = (
-              f"host={os.environ['PG_HOST']} port=5432 "
+              f"host={os.environ['PG_HOST']} port={os.environ.get('PG_PORT', '5432')} "
               f"user={os.environ['PG_USER']} password={os.environ['PG_PASS']} "
               f"dbname={os.environ['PG_DB']} "
               f"keepalives=1 keepalives_idle=30 keepalives_interval=5 "
               f"keepalives_count=5"
           )
 
-          # Local path matches DUCKLAKE_DATA_DIR in goat_values.yml.
-          # DuckLake stores parquet in S3 via the s3_* SET commands above;
-          # the local path is the catalog/ATTACH marker only.
+          # Matches DUCKLAKE_DATA_DIR in goat_values.yml. Parquet
+          # lives in S3 via the s3_* SET above; this path is just
+          # the catalog/ATTACH marker.
           data_path = "/app/data/ducklake"
           os.makedirs(data_path, exist_ok=True)
           schema = os.environ["SCHEMA"]
 
-          # No READ_ONLY → DuckDB creates the catalog if it doesn't exist.
+          # AUTOMATIC_MIGRATION TRUE is the only place a catalog
+          # format upgrade can happen — goatlib's runtime attach
+          # hardcodes its option list with no migration flag.
           con.execute(
               f"ATTACH 'ducklake:postgres:{pg_uri}' AS lake ("
               f"  DATA_PATH '{data_path}',"
-              f"  METADATA_SCHEMA '{schema}'"
+              f"  METADATA_SCHEMA '{schema}',"
+              f"  AUTOMATIC_MIGRATION TRUE"
               f")"
           )
           print(f"DuckLake initialized: schema={schema} data={data_path}")
@@ -387,16 +534,21 @@
           app.kubernetes.io/managed-by: civitas-goat-addon
       spec:
         backoffLimit: 3
+        # Hard cap so the LOAD/INSTALL fallback can't hang when an
+        # offline mirror is unreachable.
+        activeDeadlineSeconds: 300
         template:
           spec:
             restartPolicy: OnFailure
             containers:
               - name: init
-                image: "{{ goat_addon_software.images.ducklake_init.registry }}/{{ goat_addon_software.images.ducklake_init.repository }}:{{ goat_addon_software.images.ducklake_init.tag }}"
-                imagePullPolicy: "{{ goat_addon_software.images.ducklake_init.pullPolicy | default('IfNotPresent') }}"
+                image: "{{ software.addon_goat.images.processes.registry }}/{{ software.addon_goat.images.processes.repository }}:{{ software.addon_goat.images.processes.tag }}"
+                imagePullPolicy: "{{ software.addon_goat.images.processes.pullPolicy | default('IfNotPresent') }}"
                 env:
                   - name: PG_HOST
-                    value: "{{ goat_addon.db.central_db_name }}.{{ goat_addon.db.central_db_ns }}.svc.cluster.local"
+                    value: "{{ goat_addon.db.host }}"
+                  - name: PG_PORT
+                    value: "{{ goat_addon.db.port }}"
                   - name: PG_USER
                     valueFrom:
                       secretKeyRef: { name: goat-postgres-creds, key: username }
@@ -406,27 +558,29 @@
                   - name: PG_DB
                     value: "{{ goat_addon.db.goat_db_name }}"
                   - name: S3_ENDPOINT
-                    value: "minio.{{ goat_addon.namespace }}.svc.cluster.local:9000"
+                    value: "{{ goat_s3_endpoint_hostport }}"
+                  - name: S3_USE_SSL
+                    # `| string` blocks jinja2-native from coercing back
+                    # to bool and serializing as JSON `true` (fails K8s
+                    # EnvVar validation).
+                    value: "{{ goat_s3_use_ssl | string }}"
+                  - name: S3_URL_STYLE
+                    value: "{{ goat_s3_url_style }}"
                   - name: S3_KEY
                     valueFrom:
-                      secretKeyRef: { name: minio-credentials, key: access_key }
+                      secretKeyRef: { name: goat-s3-credentials, key: access_key }
                   - name: S3_SECRET
                     valueFrom:
-                      secretKeyRef: { name: minio-credentials, key: secret_key }
+                      secretKeyRef: { name: goat-s3-credentials, key: secret_key }
                   - name: BUCKET
-                    value: "{{ goat_addon.minio.bucket }}"
+                    value: "{{ goat_addon.s3.bucket }}"
                   - name: SCHEMA
                     value: "ducklake"
-                command: ["sh", "-c"]
-                args:
-                  - |
-                    set -e
-                    # Pin duckdb to match goatlib's `duckdb>=1.4.3` minimum:
-                    # newer duckdb versions ship a newer DuckLake extension
-                    # that creates catalogs geoapi's bundled goatlib can't
-                    # read ("Only DuckLake versions 0.1-0.3 are supported").
-                    pip install --quiet --no-cache-dir 'duckdb==1.4.3'
-                    python /scripts/init.py
+                # Explicit venv interpreter — processes image builds
+                # into /venv (UV_PROJECT_ENVIRONMENT); bare `python`
+                # may resolve to a system interpreter without duckdb.
+                command: ["/venv/bin/python"]
+                args: ["/scripts/init.py"]
                 volumeMounts:
                   - name: script
                     mountPath: /scripts

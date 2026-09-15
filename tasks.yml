@@ -1,65 +1,53 @@
 ---
-# Civitas-core entry point. Loaded by core_platform/playbook.yml:
-#
-#   - name: Include addons
-#     include_tasks: "{{ item }}"
-#     with_fileglob: "{{ inv_addons.addons }}"
-#     tags: ["addons", "base", "tenant"]
-#
-# Two conventions matter here, and both were verified against ansible-core
-# 2.18.6 rather than assumed:
-#
-#   1. Tag is `addons` — the uniform civitas tag, no addon-specific tag.
-#      It must be declared on each task below: the platform loader is a
-#      *looped* dynamic include, and its tag does not reach the tasks in this
-#      file. Omitting it makes `--tags addons` silently skip the whole addon.
-#
-#   2. `import_tasks` (static) for our own task files, so the `addons` tag
-#      propagates into them and their individual tasks need no tags. Inside
-#      those files, `include_tasks` of civitas shared helpers (e.g.
-#      tasks/templates/k8s-namespace.yml) works normally.
-#
-# Paths use the civitas `addon_dir` convention instead of hardcoding
-# `playbook_dir + '/addons/goat_addon/'`, so the addon works wherever it is
-# checked out. `default('')` falls back to include-relative resolution.
-
-- name: "GOAT addon: load software references"
-  ansible.builtin.include_vars:
-    file: "{{ addon_dir | default('') }}vars/software_references.yml"
+# Civitas-core entry point. Loaded by core_platform/playbook.yml via a
+# looped dynamic include, whose tag does not propagate — every task
+# below must carry `addons` explicitly, and our own task files are
+# pulled in with `import_tasks` so the tag reaches their children.
+- name: "GOAT addon"
+  when: inv_addons.goat.enable | default(false) | bool
   tags: ["addons"]
+  block:
+    - name: Include GOAT vars
+      include_vars:
+        dir: vars
 
-- name: "GOAT addon: load defaults"
-  ansible.builtin.include_vars:
-    file: "{{ addon_dir | default('') }}vars/default.yml"
-  tags: ["addons"]
+    # geoapi and processes need controller-specific prefix stripping.
+    # Without a matching profile they fall through to the `/` catch-all.
+    - name: "GOAT addon: assert ingress class is supported by the profile map"
+      ansible.builtin.assert:
+        that: inv_k8s.ingress_class in goat_addon.ingress.profiles
 
-- name: "GOAT addon: create namespace and mirror the civitas CA"
-  ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/00_namespace.yml"
-  tags: ["addons"]
+    - name: "GOAT addon: create namespace and mirror the civitas CA"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/00_namespace.yml"
 
-- name: "GOAT addon: provision DB users (goat + windmill)"
-  ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/01_db.yml"
-  tags: ["addons"]
+    - name: "GOAT addon: provision DB users (goat + windmill)"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/01_db.yml"
 
-- name: "GOAT addon: deploy object storage (MinIO) + DuckLake volume"
-  ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/05_minio.yml"
-  tags: ["addons"]
+    # Certificate before the first Ingress so cert-manager can start the
+    # ACME order before MinIO's Ingress references `<ingress-host>-tls`.
+    - name: "GOAT addon: provision explicit TLS Certificate"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/06_certificate.yml"
 
-- name: "GOAT addon: register Keycloak client"
-  ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/02_keycloak_client.yml"
-  tags: ["addons"]
+    - name: "GOAT addon: deploy object storage (MinIO) + DuckLake volume"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/05_minio.yml"
 
-- name: "GOAT addon: helm install"
-  ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/03_helm_install.yml"
-  tags: ["addons"]
+    - name: "GOAT addon: register Keycloak client"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/02_keycloak_client.yml"
 
-# Everything below is handled by the chart's own post-install hooks, so the
-# addon has no tasks for it:
-#   * windmill workspace + admin password rotation + API token   (v0.3.4)
-#   * DuckLake catalog ATTACH                                    (v0.3.6)
-#   * windmill workspace variables (POSTGRES_*, S3_*, ...)       (v0.3.7)
-#   * alembic upgrade + initial_data                             (v0.4.0)
+    - name: "GOAT addon: helm install"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/03_helm_install.yml"
 
-- name: "GOAT addon: health check"
-  ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/99_health_check.yml"
-  tags: ["addons"]
+    # Traefik-only stripPrefix Middleware CRDs. `include_tasks` so the
+    # `when:` gate short-circuits the file load on other controllers.
+    - name: "GOAT addon: Traefik-only — create stripPrefix Middleware CRDs"
+      ansible.builtin.include_tasks: "{{ addon_dir | default('') }}tasks/04_ingress_middleware.yml"
+      when: inv_k8s.ingress_class == 'traefik'
+
+    # Handled by the chart's own post-install hooks (no addon tasks):
+    #   * windmill workspace + admin password + API token
+    #   * DuckLake catalog ATTACH
+    #   * windmill workspace variables (POSTGRES_*, S3_*, ...)
+    #   * alembic upgrade + initial_data
+
+    - name: "GOAT addon: health check"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/99_health_check.yml"
