@@ -1,0 +1,103 @@
+---
+# S3 resolution layer. `goat_addon.s3.mode` decides what backs the
+# stack's object storage.
+# `provision` deploys a single-replica MinIO via s3_provision.yml
+# (mirrors plan4better's compose topology, not HA).
+# `attach` uses a pre-existing S3-compatible endpoint. The addon
+# creates nothing inside the S3 system.
+# Mode picks the endpoint and the credential source here. Every
+# client-facing value downstream (TLS, URL style, port, host, SNI)
+# derives from the resolved `goat_s3_endpoint`, never from the mode.
+
+- name: GOAT addon preflight s3.mode is supported
+  ansible.builtin.assert:
+    that:
+      - goat_addon.s3.mode in ['provision', 'attach']
+    fail_msg: >-
+      goat_addon.s3.mode = '{{ goat_addon.s3.mode }}' but must be one of
+      'provision' or 'attach'. See vars/default.yml.
+
+- name: GOAT addon preflight attach-mode S3 endpoint config
+  ansible.builtin.assert:
+    that:
+      - goat_addon.s3.endpoint | length > 0
+    fail_msg: >-
+      goat_addon.s3.mode = 'attach' but endpoint is empty. Set
+      inv_addons.goat.s3.endpoint to the cluster-internal S3 URL.
+  when: goat_addon.s3.mode == 'attach'
+
+- name: GOAT addon preflight attach-mode S3 credentials provided
+  ansible.builtin.assert:
+    that:
+      - goat_addon.s3.access_key | length > 0
+      - goat_addon.s3.secret_key | length > 0
+    fail_msg: >-
+      goat_addon.s3.mode = 'attach' but access_key or secret_key are
+      empty. Set inv_addons.goat.s3.access_key and secret_key (source
+      them from ansible-vault).
+  when: goat_addon.s3.mode == 'attach'
+
+# Cluster-internal S3 endpoint every consumer derives from. Trailing
+# slash forbidden. Consumers concatenate `/<bucket>/<key>` and SigV4
+# signs the canonical URI, so a double slash breaks every signature.
+- name: GOAT addon resolve S3 endpoint
+  ansible.builtin.set_fact:
+    goat_s3_endpoint: >-
+      {{ (goat_addon.s3.endpoint
+          if goat_addon.s3.mode == 'attach'
+          else 'http://minio.' + goat_addon.namespace + '.svc.cluster.local:9000')
+         | trim | regex_replace('/+$', '') }}
+
+# provision mode reuses existing credentials on rerun if the Secret is present.
+- name: GOAT addon check for existing goat-s3-credentials secret
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: v1
+    kind: Secret
+    name: goat-s3-credentials
+    namespace: "{{ goat_addon.namespace }}"
+  register: goat_s3_existing_secret
+  when: goat_addon.s3.mode == 'provision'
+
+- name: GOAT addon resolve S3 credentials
+  block:
+    - name: GOAT addon use attach-mode S3 credentials from inventory
+      ansible.builtin.set_fact:
+        goat_s3_access_key: "{{ goat_addon.s3.access_key }}"
+        goat_s3_secret_key: "{{ goat_addon.s3.secret_key }}"
+      when: goat_addon.s3.mode == 'attach'
+
+    - name: GOAT addon reuse existing S3 credentials
+      ansible.builtin.set_fact:
+        goat_s3_access_key: "{{ goat_s3_existing_secret.resources[0].data.access_key | b64decode }}"
+        goat_s3_secret_key: "{{ goat_s3_existing_secret.resources[0].data.secret_key | b64decode }}"
+      when:
+        - goat_addon.s3.mode == 'provision'
+        - goat_s3_existing_secret.resources | length > 0
+
+    - name: GOAT addon generate new S3 credentials
+      ansible.builtin.set_fact:
+        goat_s3_access_key: "goat-{{ lookup('community.general.random_string', length=12, special=false) | lower }}"
+        goat_s3_secret_key: "{{ lookup('community.general.random_string', length=40, special=false) }}"
+      when:
+        - goat_addon.s3.mode == 'provision'
+        - goat_s3_existing_secret.resources | length == 0
+
+- name: GOAT addon persist S3 credentials secret
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: goat-s3-credentials
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      type: Opaque
+      stringData:
+        access_key: "{{ goat_s3_access_key }}"
+        secret_key: "{{ goat_s3_secret_key }}"

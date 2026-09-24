@@ -1,50 +1,253 @@
-# /home/p4b/civitas-goat-addon/vars/default.yml
 ---
+addon_dir: "addons/goat_addon/"
+
+# Hoisted out of `goat_addon` to avoid a self-referential template loop
+# when a sibling key resolves this FQDN during rendering.
+goat_central_db_fqdn: "{{ (inv_addons.goat.db.central_db_name | default('central-db')) + '.' + inv_central_db.ns_name + '.svc.cluster.local' }}"
+
 goat_addon:
   namespace: "{{ inv_addons.goat.namespace | default(ENVIRONMENT + '-goat-stack') }}"
-  # Civitas conventions: every stack declares whether it creates its own
-  # namespace and which kubeconfig it talks to. `ns_kubeconfig` is resolved
-  # against K8S_KUBECONFIG_PATH in 00_namespace.yml, exactly as inv_op_stack /
-  # inv_gd / inv_datacatalog do.
   ns_create: "{{ inv_addons.goat.ns_create | default(true) }}"
+  # Resolved against K8S_KUBECONFIG_PATH in namespace.yml.
   ns_kubeconfig: "{{ inv_addons.goat.ns_kubeconfig | default(kubeconfig_file) }}"
-  # Chart + image refs are the canonical source for which artifacts this
-  # addon pulls. Set in vars/software_references.yml; surfaced here so
-  # inventory can still override per-deployment without forking the file.
+  # Default pulls the chart from plan4better's public OCI registry.
+  # Override `chart.ref` to a filesystem path for offline installs.
   chart:
-    ref: "{{ inv_addons.goat.chart.ref | default(goat_addon_software.helm_repo_url + '/' + goat_addon_software.helm_chart_name) }}"
-    version: "{{ inv_addons.goat.chart.version | default(goat_addon_software.helm_chart_version) }}"
+    ref: "{{ inv_addons.goat.chart.ref | default(software.addon_goat.helm_repo_url + '/' + software.addon_goat.helm_chart_name) }}"
+    version: "{{ inv_addons.goat.chart.version | default(software.addon_goat.helm_chart_version) }}"
   db:
     central_db_ns: "{{ inv_central_db.ns_name }}"
-    central_db_name: "central-db"
-    # DB names. Defaults match upstream compose / chart conventions. Vary if
-    # you need to co-tenant two installs in the same Postgres cluster — but
-    # note windmill's *role names* (windmill_admin, windmill_user) are
-    # hardcoded by its migrations regardless of DB name, so two installs
-    # sharing one cluster would still collide on roles.
+    # Zalando cluster NAME, not an endpoint. db.yml derives per-DB
+    # credential Secret names from this and runs psql via k8s_exec in
+    # the master pod, so it must stay the cluster name regardless of
+    # any per-service host override below.
+    central_db_name: "{{ inv_addons.goat.db.central_db_name | default('central-db') }}"
+    # Runtime Postgres endpoint the workloads dial. Provisioning in
+    # db.yml is unaffected. It never reads host/port.
+    host: "{{ inv_addons.goat.db.host | default(goat_central_db_fqdn) }}"
+    port: "{{ inv_addons.goat.db.port | default(5432) | int }}"
+    # Per-service override for windmill. Defaults to `host`/`port`.
+    # Nested default() on purpose. A chained `| default | default`
+    # picks the wrong fallback when `host` is set but `windmill_host`
+    # is not.
+    windmill_host: "{{ inv_addons.goat.db.windmill_host | default(inv_addons.goat.db.host | default(goat_central_db_fqdn)) }}"
+    windmill_port: "{{ inv_addons.goat.db.windmill_port | default(inv_addons.goat.db.port | default(5432)) | int }}"
+    # Per-service override for geoapi. Defaults to `host`/`port`.
+    geoapi_host: "{{ inv_addons.goat.db.geoapi_host | default(inv_addons.goat.db.host | default(goat_central_db_fqdn)) }}"
+    geoapi_port: "{{ inv_addons.goat.db.geoapi_port | default(inv_addons.goat.db.port | default(5432)) | int }}"
+    # windmill role names (windmill_admin, windmill_user) are
+    # hardcoded by its migrations regardless of db name, so two
+    # installs sharing one cluster collide on roles.
     goat_db_name: "{{ inv_addons.goat.db.goat_db_name | default('goat') }}"
     windmill_db_name: "{{ inv_addons.goat.db.windmill_db_name | default('windmill') }}"
   keycloak:
-    # Client ID created in the civitas Keycloak realm. Defaults to `goat-web`,
-    # matching the convention used by plan4better's standalone infra.
     client_id: "{{ inv_addons.goat.keycloak.client_id | default('goat-web') }}"
+    # Login gate. When true, only members of `gate_group` can log in to
+    # GOAT. Everyone else is denied at authentication time. Off by
+    # default. Standard Civitas deployments do not restrict GOAT access.
+    # Disabling only unbinds the flow. Role, group and flow stay in the realm.
+    limit_access: "{{ inv_addons.goat.keycloak.limit_access | default(false) | bool }}"
+    gate_role: "{{ inv_addons.goat.keycloak.gate_role | default('goat-user') }}"
+    gate_group: "{{ inv_addons.goat.keycloak.gate_group | default('goat-users') }}"
+    flow_alias: "{{ inv_addons.goat.keycloak.flow_alias | default('goat-browser') }}"
+    deny_message: "{{ inv_addons.goat.keycloak.deny_message | default('Ihr Benutzerkonto ist nicht für GOAT freigeschaltet. Bitte wenden Sie sich an Ihre Administration.') }}"
   web:
-    # Public URL of the GOAT web frontend. Used for Keycloak redirect URIs
-    # and NEXTAUTH_URL. Defaults to https://goat.<DOMAIN>.
-    public_url: "{{ inv_addons.goat.web.public_url | default('https://goat.' + DOMAIN) }}"
-  minio:
-    # MinIO bucket name. DuckLake parquet files + uploaded assets land here.
-    bucket: "{{ inv_addons.goat.minio.bucket | default('goat') }}"
+    # ingress-host resolves to <subdomain>.<INGRESS_DOMAIN | DOMAIN>.
+    # public URL resolves to https://<subdomain>.<DOMAIN>.
+    subdomain: "{{ inv_addons.goat.web.subdomain | default('goat') }}"
+    # Browser-facing URL for NEXT_PUBLIC_*, Keycloak redirectUris and
+    # presigned S3. Override only if it must differ from the default.
+    public_url: "{{ inv_addons.goat.web.public_url | default('https://' + (inv_addons.goat.web.subdomain | default('goat')) + '.' + DOMAIN) }}"
+  s3:
+    bucket: "{{ inv_addons.goat.s3.bucket | default('goat') }}"
+    # `provision` deploys a single-replica MinIO in-namespace (not HA).
+    # `attach` connects any S3-compatible endpoint and requires
+    # access_key, secret_key, region, and a pre-existing bucket.
+    mode: "{{ inv_addons.goat.s3.mode | default('provision') }}"
+    # Cluster-internal endpoint (attach mode). The browser-facing
+    # URL is always goat_public_url. The addon runs a `/<bucket>`
+    # Ingress that proxies here.
+    endpoint: "{{ inv_addons.goat.s3.endpoint | default('') }}"
+    # Required non-empty in attach mode. Sourced from ansible-vault.
+    # The addon writes them into `goat-s3-credentials`.
+    access_key: "{{ inv_addons.goat.s3.access_key | default('') }}"
+    secret_key: "{{ inv_addons.goat.s3.secret_key | default('') }}"
+    # Optional PEM on the Ansible controller. Concatenated with
+    # inv_k8s.ingress.ca_path into the cacert ConfigMap and consumed
+    # by every pod-side S3 client via AWS_CA_BUNDLE and CURL_CA_BUNDLE.
+    customCACert: "{{ inv_addons.goat.s3.customCACert | default('') }}"
+    region: "{{ inv_addons.goat.s3.region | default('us-east-1') }}"
+    # Tunables for the `/<bucket>` passthrough Ingress (s3_gateway.yml).
+    proxy:
+      # ingress-nginx defaults to 1 MB, which 413s any real upload.
+      max_body_size: "{{ inv_addons.goat.s3.proxy.max_body_size | default('5g') }}"
+      # No-op unless a `proxy-ssl-secret` (client-CA) is provisioned
+      # separately. The addon does not create one. Only consulted
+      # when s3.endpoint is https://.
+      ssl_verify: "{{ inv_addons.goat.s3.proxy.ssl_verify | default(false) | bool }}"
+      # SNI for the upstream TLS handshake. Empty derives from the
+      # resolved endpoint's hostname. ingress-nginx's built-in default
+      # is the literal `upstream_balancer`, which no S3 endpoint
+      # serves a cert for.
+      ssl_name: "{{ inv_addons.goat.s3.proxy.ssl_name | default('') }}"
+      # `Host` header sent to the upstream.
+      # None: s3_gateway.yml uses `goat_public_host`. SigV4 signs
+      #       the host on presigned GETs, so pods must see the
+      #       same value the browser signed against.
+      # "":   annotation omitted. ingress-nginx forwards the
+      #       client-supplied Host verbatim.
+      # any:  literal upstream-vhost value.
+      upstream_vhost: "{{ inv_addons.goat.s3.proxy.upstream_vhost | default(None) }}"
   ducklake:
     pvc_size: "{{ inv_addons.goat.ducklake.pvc_size | default('20Gi') }}"
-    # RWX for real multi-node clusters; local-path (k3d/k3s default) cannot
-    # provision RWX — set ReadWriteOnce there (sharing then relies on
-    # co-scheduling, see README).
+    # RWX for multi-node clusters. local-path (k3d/k3s) cannot
+    # provision RWX. Set ReadWriteOnce there.
     pvc_access_mode: "{{ inv_addons.goat.ducklake.pvc_access_mode | default('ReadWriteMany') }}"
-  # Windmill workspace + admin password rotation are handled by the chart
-  # itself (post-install hook, since chart v0.3.4). The addon doesn't need
-  # any windmill-app config — just point processes at the chart-managed
-  # token Secret (`goat-windmill-token`) in templates/goat_values.yml.
+    # Block-backed classes (Ceph RBD, EBS, GCE PD, Azure Disk) cannot
+    # satisfy ReadWriteMany. The PVC then sits Pending forever.
+    storage_class: "{{ inv_addons.goat.ducklake.storage_class | default(inv_k8s.storage_class.rwx) }}"
+  # Controller-specific prefix stripping for the two services without
+  # FastAPI root_path support (geoapi, processes). Selected by
+  # inv_k8s.ingress_class. tasks.yml asserts unknown values.
+  ingress:
+    # traefik.io/v1alpha1 (v3, default) or traefik.containo.us/v1alpha1 (v2).
+    traefik_api_group: "{{ inv_addons.goat.ingress.traefik_api_group | default('traefik.io/v1alpha1') }}"
+    profiles:
+      nginx:
+        # Annotation-driven regex rewrite.
+        path_suffix: "(/|$)(.*)"
+        pathType: "ImplementationSpecific"
+        annotations:
+          nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+          nginx.ingress.kubernetes.io/use-regex: "true"
+        needs_middleware: false
+      traefik:
+        # Traefik has no annotation-level path rewrite. Stripping
+        # requires a stripPrefix Middleware CRD referenced by each
+        # ingress. Annotation format `<ns>-<name>@kubernetescrd`
+        # is mandatory and fails silently when wrong.
+        path_suffix: ""
+        pathType: "Prefix"
+        annotations: {}
+        needs_middleware: true
   health_check:
     retries: 30
     delay_seconds: 10
+
+# Derived values. Consumed by templates/goat_values.yml, the s3_*
+# task files and certificate.yml. Top-level (not inside `goat_addon`)
+# for the same recursion reason as `goat_central_db_fqdn` above.
+#
+# Reverse-proxy topology. ingress-host is what the cluster ingress
+# controller sees (SNI, Host, TLS cert). public host is what the
+# browser sees. With no fronting proxy the two coincide.
+goat_ingress_host: "{{ (goat_addon.web.subdomain | default('goat')) + '.' + (INGRESS_DOMAIN | default(DOMAIN)) }}"
+# Subdomain or domain changes rotate to a new secret. The old one lingers.
+goat_tls_secret: "{{ goat_ingress_host }}-tls"
+goat_public_url: "{{ goat_addon.web.public_url }}"
+goat_public_host: "{{ goat_public_url | regex_replace('^https?://', '') | regex_replace('/+$', '') }}"
+
+# Path-style is structural — the addon fronts S3 at `/<bucket>` on the
+# public GOAT host; vhost addressing has no DNS or cert behind it. Both
+# terms are pinned because upstream's use_path_style() is
+# `force or provider == "minio"` (goatlib storage/s3_config.py:16), so
+# either being dropped still leaves path-style. `minio` names the
+# addressing class here, not the product — Dell ECS gets it too.
+goat_s3_provider: "minio"
+goat_s3_url_style: "path"
+
+# Everything below derives from `goat_s3_endpoint`, the fact set by
+# s3_resolve.yml. Never from `goat_addon.s3.mode`, and never from the
+# raw inventory endpoint. Lazy templating resolves these only at
+# consumption, which always happens after s3_resolve.yml ran.
+goat_s3_endpoint_is_tls: "{{ goat_s3_endpoint.startswith('https://') }}"
+goat_s3_use_ssl: "{{ 'true' if (goat_s3_endpoint_is_tls | bool) else 'false' }}"
+# host:port form for DuckDB's `s3_endpoint`, which wants no scheme.
+goat_s3_endpoint_hostport: "{{ goat_s3_endpoint | regex_replace('^https?://', '') }}"
+
+# MUST equal `/` + bucket name. path-style SigV4 signs the canonical
+# URI, so any other prefix breaks every presigned URL.
+goat_s3_ingress_path: "/{{ goat_addon.s3.bucket }}"
+# Three-state per the `upstream_vhost` knob above.
+goat_s3_upstream_vhost: "{{ goat_public_host if (goat_addon.s3.proxy.upstream_vhost is none) else goat_addon.s3.proxy.upstream_vhost }}"
+# Default SNI to the endpoint hostname. ingress-nginx's built-in
+# default resolves to the literal `upstream_balancer`.
+goat_s3_proxy_ssl_name: "{{ goat_addon.s3.proxy.ssl_name if (goat_addon.s3.proxy.ssl_name | length > 0) else (goat_s3_endpoint | urlsplit('hostname') | default('', true)) }}"
+
+# Upstream port for the `/<bucket>` proxy. Split into named steps and
+# only referenced inside block-scalar `definition: |` strings so the
+# k8s module parses it as a native int. jinja2 without jinja2_native
+# stringifies it in inline dicts and the API server rejects
+# `port: "9000"`.
+goat_s3_endpoint_port: "{{ goat_s3_endpoint | urlsplit('port') }}"
+goat_s3_scheme_default_port: "{{ 443 if (goat_s3_endpoint_is_tls | bool) else 80 }}"
+goat_s3_upstream_port: "{{ goat_s3_endpoint_port | default(goat_s3_scheme_default_port, true) | int }}"
+
+# Keycloak login gate (keycloak.yml, keycloak.limit_access). Subflow
+# and config aliases must be unique per realm, hence the flow prefix.
+goat_kc_wrapper_alias: "{{ goat_addon.keycloak.flow_alias }}-login"
+goat_kc_gate_alias: "{{ goat_addon.keycloak.flow_alias }}-gate"
+goat_kc_org_alias: "{{ goat_addon.keycloak.flow_alias }}-organization"
+goat_kc_org_cond_alias: "{{ goat_addon.keycloak.flow_alias }}-organization-conditional"
+goat_kc_forms_alias: "{{ goat_addon.keycloak.flow_alias }}-forms"
+goat_kc_condition_cfg_alias: "{{ goat_addon.keycloak.flow_alias }}-gate-condition"
+goat_kc_deny_cfg_alias: "{{ goat_addon.keycloak.flow_alias }}-gate-deny"
+
+# Execution tree for the gate browser flow, in creation order. Priority
+# within a parent follows creation order. Items with `alias` become
+# subflows, items with `provider` become executions.
+#
+# The wrapper subflow is load-bearing. Keycloak ignores ALTERNATIVE
+# executions when a REQUIRED one sits at the same level, so placing the
+# gate next to Cookie or forms would break every login path. The gate
+# comes second because the role condition needs a resolved user.
+#
+# The organization subflow is KC 26's identity-first login, unrelated
+# to GOAT organizations (name collision only). Mirrored from the default
+# browser flow so the gate flow does not silently disable that feature.
+goat_kc_flow_executions:
+  - parent: "{{ goat_addon.keycloak.flow_alias }}"
+    alias: "{{ goat_kc_wrapper_alias }}"
+    requirement: REQUIRED
+  - parent: "{{ goat_kc_wrapper_alias }}"
+    provider: auth-cookie
+    requirement: ALTERNATIVE
+  - parent: "{{ goat_kc_wrapper_alias }}"
+    provider: identity-provider-redirector
+    requirement: ALTERNATIVE
+  - parent: "{{ goat_kc_wrapper_alias }}"
+    alias: "{{ goat_kc_org_alias }}"
+    requirement: ALTERNATIVE
+  - parent: "{{ goat_kc_org_alias }}"
+    alias: "{{ goat_kc_org_cond_alias }}"
+    requirement: CONDITIONAL
+  - parent: "{{ goat_kc_org_cond_alias }}"
+    provider: conditional-user-configured
+    requirement: REQUIRED
+  - parent: "{{ goat_kc_org_cond_alias }}"
+    provider: organization
+    requirement: ALTERNATIVE
+  - parent: "{{ goat_kc_wrapper_alias }}"
+    alias: "{{ goat_kc_forms_alias }}"
+    requirement: ALTERNATIVE
+  - parent: "{{ goat_kc_forms_alias }}"
+    provider: auth-username-password-form
+    requirement: REQUIRED
+  - parent: "{{ goat_addon.keycloak.flow_alias }}"
+    alias: "{{ goat_kc_gate_alias }}"
+    requirement: CONDITIONAL
+  - parent: "{{ goat_kc_gate_alias }}"
+    provider: conditional-user-role
+    requirement: REQUIRED
+    config:
+      alias: "{{ goat_kc_condition_cfg_alias }}"
+      config:
+        condUserRole: "{{ goat_addon.keycloak.client_id }}.{{ goat_addon.keycloak.gate_role }}"
+        negate: "true"
+  - parent: "{{ goat_kc_gate_alias }}"
+    provider: deny-access-authenticator
+    requirement: REQUIRED
+    config:
+      alias: "{{ goat_kc_deny_cfg_alias }}"
+      config:
+        denyErrorMessage: "{{ goat_addon.keycloak.deny_message }}"

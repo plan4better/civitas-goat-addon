@@ -1,0 +1,45 @@
+---
+# Uses the civitas helm wrapper. Values are rendered via
+# lookup('template') in-memory. `helm_values_rcombine` lets operators
+# override any key from `inv_addons.goat.helm_values` without forking.
+#
+# `helm_repo_name` and `helm_chart_version` are unset on purpose. The
+# wrapper takes its "install from reference" branch and runs
+# `helm install <name> <helm_chart_reference>` verbatim, defaulting
+# to the OCI URL. helm without --version resolves OCI to "latest".
+# A pre-fetched tgz override pins the version for now.
+
+# Bitnami's bundled redis auto-generates a password on first install
+# and stores it in `goat-redis`. Subsequent `helm upgrade` runs refuse
+# to render unless `global.redis.password` is supplied. The task reads
+# it back and threads it through. Empty on first install (Bitnami
+# generates the password itself).
+- name: GOAT addon fetch existing redis password, populated after first install
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ goat_addon.namespace }}"
+    name: goat-redis
+  register: existing_redis_secret
+
+- name: GOAT addon thread existing redis password into helm values on upgrade
+  ansible.builtin.set_fact:
+    redis_password_override:
+      global:
+        redis:
+          password: "{{ existing_redis_secret.resources[0].data['redis-password'] | b64decode }}"
+  when:
+    - existing_redis_secret.resources | length > 0
+    - existing_redis_secret.resources[0].data['redis-password'] is defined
+
+- name: Helm create the GOAT installation
+  ansible.builtin.include_tasks: tasks/templates/k8s-helm.yml
+  vars:
+    helm_chart_name: "{{ software.addon_goat.helm_chart_name }}"
+    helm_release_name: "{{ software.addon_goat.helm_release_name }}"
+    helm_chart_reference: "{{ goat_addon.chart.ref }}"
+    helm_values_file: "{{ addon_dir | default('') }}templates/goat_values.yml"
+    helm_values_rcombine: "{{ (inv_addons.goat.helm_values | default({})) | combine(redis_password_override | default({}), recursive=True) }}"
+    helm_create_namespace: false

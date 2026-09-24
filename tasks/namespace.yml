@@ -1,0 +1,40 @@
+---
+# Civitas convention. k8s_config, k8s_context and k8s_namespace are
+# set once and reused for every kubernetes.core.* call and shared helper.
+- name: GOAT addon set default facts for K8S
+  ansible.builtin.set_fact:
+    k8s_config: "{{ K8S_KUBECONFIG_PATH }}/{{ goat_addon.ns_kubeconfig }}"
+    k8s_context: "{{ inv_k8s.config.context }}"
+    k8s_namespace: "{{ goat_addon.namespace }}"
+
+# Uses the shared helper so `inv_k8s.podSecurityAdmission.enable` is
+# honoured (stamps `pod-security.kubernetes.io/enforce: restricted`).
+- name: GOAT addon create a k8s namespace
+  ansible.builtin.include_tasks: tasks/templates/k8s-namespace.yml
+  when: goat_addon.ns_create | bool
+
+# Two sources feed one ConfigMap so pods carry a single trust bundle.
+# inv_k8s.ingress.ca_path is the ingress and Keycloak cert (NextAuth,
+# REQUESTS_CA_BUNDLE, SSL_CERT_FILE). goat_addon.s3.customCACert is the
+# external S3 endpoint cert (boto3, DuckDB httpfs) for attach-mode S3
+# behind a private CA.
+- name: GOAT addon create cacert ConfigMap
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: cacert
+        namespace: "{{ k8s_namespace }}"
+      data:
+        cacert.crt: |
+          {% if (inv_k8s.ingress.ca_path | default('')) != '' -%}
+          {{ lookup('file', inv_k8s.ingress.ca_path) }}
+          {% endif -%}
+          {% if (goat_addon.s3.customCACert | default('')) != '' -%}
+          {{ lookup('file', goat_addon.s3.customCACert) }}
+          {% endif -%}
+  when: (inv_k8s.ingress.ca_path | default('')) != '' or (goat_addon.s3.customCACert | default('')) != ''

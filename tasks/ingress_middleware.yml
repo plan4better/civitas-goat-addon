@@ -1,0 +1,35 @@
+---
+# Traefik-only. One `stripPrefix` Middleware per prefix-stripped
+# service. Skipped on other controllers. ingress-nginx does the
+# rewrite via annotation, see the nginx profile in vars/default.yml.
+#
+# API group is `traefik.io/v1alpha1` (v3) or `traefik.containo.us/v1alpha1`
+# (v2). Same Kind and spec. Only the group differs. Overridable via
+# `inv_addons.goat.ingress.traefik_api_group`.
+#
+# Runs after the Helm install. Chart Ingresses reference the
+# middleware only by annotation, and the CRD may only appear with
+# the chart's dependencies.
+
+- name: "GOAT addon traefik create stripPrefix Middleware for {{ item.svc }}"
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    definition:
+      apiVersion: "{{ goat_addon.ingress.traefik_api_group }}"
+      kind: Middleware
+      metadata:
+        name: "goat-strip-{{ item.svc }}"
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        stripPrefix:
+          prefixes:
+            - "{{ item.prefix }}"
+  loop:
+    - { svc: geoapi, prefix: /geoapi }
+    - { svc: processes, prefix: /processes }
+  loop_control:
+    label: "goat-strip-{{ item.svc }}"

@@ -1,0 +1,212 @@
+---
+# DuckLake volume and catalog bootstrap. The bootstrap Job consumes the
+# resolved S3 endpoint and the goat-s3-credentials Secret and requires
+# the bucket to exist. Kept as the last S3 include in tasks.yml.
+
+# Shared DuckLake volume. Workflows write parquet under
+# /app/data/ducklake and geoapi reads it. Mounted on tools, workflows
+# and geoapi via existingClaim and extraVolumes in goat_values.yml.
+- name: "GOAT addon: create shared DuckLake data PVC"
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: goat-ducklake-data
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        accessModes:
+          - "{{ goat_addon.ducklake.pvc_access_mode | default('ReadWriteMany') }}"
+        storageClassName: "{{ goat_addon.ducklake.storage_class }}"
+        resources:
+          requests:
+            storage: "{{ goat_addon.ducklake.pvc_size | default('20Gi') }}"
+
+# DuckLake bootstrap. The chart's `DUCKLAKE_CREATE_IF_NOT_EXISTS` is
+# unused. geoapi attaches READ_ONLY and DuckDB refuses to create a
+# missing lake. A one-shot ATTACH (RW, no READ_ONLY) creates the
+# catalog tables in Postgres and the metadata layout in S3.
+#
+# Runs from the `processes` image so its DuckDB extension version is
+# the same one every runtime consumer later attaches with. A bare
+# python image with `pip install duckdb==X` decouples the catalog
+# format from runtime and produces `catalog version mismatch` at attach.
+- name: "GOAT addon: fetch goat-postgres-creds for ducklake init"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: v1
+    kind: Secret
+    name: goat-postgres-creds
+    namespace: "{{ goat_addon.namespace }}"
+  register: goat_pg_creds
+
+- name: "GOAT addon: create ducklake-init script ConfigMap"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ducklake-init-script
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      data:
+        init.py: |
+          """One-shot DuckLake catalog bootstrap. Runs from the processes image.
+          Extensions are baked into DuckDB's default dir ($HOME/.duckdb/extensions).
+          The upstream geoapi/processes images do NOT set DUCKDB_EXTENSION_DIRECTORY."""
+
+          import os
+          import duckdb
+          from goatlib.storage.ducklake import REQUIRED_DUCKDB_EXTENSIONS
+
+          ext_dir = os.environ.get("DUCKDB_EXTENSION_DIRECTORY") or os.path.join(
+              os.path.expanduser("~"), ".duckdb", "extensions"
+          )
+          if not os.path.isdir(ext_dir):
+              raise RuntimeError(f"baked extension dir missing: {ext_dir} (HOME={os.environ.get('HOME')})")
+
+          con = duckdb.connect()
+          con.execute(f"SET extension_directory='{ext_dir}'")
+          con.execute("SET autoinstall_known_extensions=false")
+          con.execute("SET autoload_known_extensions=false")
+          print("extension_directory:",
+                con.execute("select current_setting('extension_directory')").fetchone()[0])
+          for ext in REQUIRED_DUCKDB_EXTENSIONS:      # spatial, httpfs, postgres, ducklake
+              con.execute(f"LOAD {ext};")
+
+          # DuckDB takes the endpoint as host[:port]. The scheme becomes a flag.
+          con.execute("SET s3_endpoint = ?;", [os.environ["S3_ENDPOINT"].split("://", 1)[-1]])
+          con.execute("SET s3_access_key_id = ?;", [os.environ["S3_KEY"]])
+          con.execute("SET s3_secret_access_key = ?;", [os.environ["S3_SECRET"]])
+          url_style = os.environ.get("S3_URL_STYLE", "path")
+          if url_style not in ("path", "vhost"):
+              raise ValueError(f"S3_URL_STYLE must be 'path' or 'vhost', got: {url_style!r}")
+          con.execute(f"SET s3_url_style = '{url_style}';")
+          use_ssl = os.environ.get("S3_USE_SSL", "false").lower() == "true"
+          con.execute(f"SET s3_use_ssl = {'true' if use_ssl else 'false'};")
+          ca_bundle = os.environ.get("S3_CA_BUNDLE_PATH", "")
+          if ca_bundle:
+              con.execute(f"SET s3_ca_bundle_path = '{ca_bundle}';")
+
+          pg_uri = (
+              f"host={os.environ['PG_HOST']} port={os.environ.get('PG_PORT', '5432')} "
+              f"user={os.environ['PG_USER']} password={os.environ['PG_PASS']} "
+              f"dbname={os.environ['PG_DB']} "
+              f"keepalives=1 keepalives_idle=30 keepalives_interval=5 keepalives_count=5"
+          )
+
+          data_path = "/app/data/ducklake"   # matches DUCKLAKE_DATA_DIR in goat_values.yml
+          os.makedirs(data_path, exist_ok=True)
+          schema = os.environ["SCHEMA"]
+
+          # AUTOMATIC_MIGRATION TRUE is a fork divergence. goatlib's runtime ATTACH
+          # hardcodes its option list with no migration flag, so this Job is the only
+          # place a catalog format upgrade can happen.
+          con.execute(
+              f"ATTACH 'ducklake:postgres:{pg_uri}' AS lake ("
+              f"  DATA_PATH '{data_path}',"
+              f"  METADATA_SCHEMA '{schema}',"
+              f"  AUTOMATIC_MIGRATION TRUE"
+              f")"
+          )
+          print(f"DuckLake initialized: schema={schema} data={data_path}")
+          con.close()
+
+- name: "GOAT addon: clean up prior ducklake-init Job"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: ducklake-init
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+
+- name: "GOAT addon: bootstrap DuckLake catalog one-shot"
+  vars:
+    _ca_env: "{{ [
+        {'name': 'AWS_CA_BUNDLE', 'value': '/etc/ssl/cacert/cacert.crt'},
+        {'name': 'CURL_CA_BUNDLE', 'value': '/etc/ssl/cacert/cacert.crt'},
+        {'name': 'S3_CA_BUNDLE_PATH', 'value': '/etc/ssl/cacert/cacert.crt'},
+      ] if goat_addon.s3.customCACert != '' else [] }}"
+    _ca_volume_mount: "{{ [
+        {'name': 'cacert', 'mountPath': '/etc/ssl/cacert', 'readOnly': True},
+      ] if goat_addon.s3.customCACert != '' else [] }}"
+    _ca_volume: "{{ [
+        {'name': 'cacert', 'configMap': {'name': 'cacert', 'optional': True}},
+      ] if goat_addon.s3.customCACert != '' else [] }}"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: ducklake-init
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        backoffLimit: 3
+        ttlSecondsAfterFinished: 60
+        # Hard cap so the LOAD or INSTALL fallback cannot hang when an
+        # offline mirror is unreachable.
+        activeDeadlineSeconds: 300
+        template:
+          spec:
+            restartPolicy: OnFailure
+            containers:
+              - name: init
+                image: "{{ software.addon_goat.images.processes.registry }}/{{ software.addon_goat.images.processes.repository }}:{{ software.addon_goat.images.processes.tag }}"
+                imagePullPolicy: "{{ software.addon_goat.images.processes.pullPolicy | default('IfNotPresent') }}"
+                env: "{{ [
+                    {'name': 'PG_HOST', 'value': goat_addon.db.host},
+                    {'name': 'PG_PORT', 'value': goat_addon.db.port | string},
+                    {'name': 'PG_USER', 'valueFrom': {'secretKeyRef': {'name': 'goat-postgres-creds', 'key': 'username'}}},
+                    {'name': 'PG_PASS', 'valueFrom': {'secretKeyRef': {'name': 'goat-postgres-creds', 'key': 'password'}}},
+                    {'name': 'PG_DB', 'value': goat_addon.db.goat_db_name},
+                    {'name': 'S3_ENDPOINT', 'value': goat_s3_endpoint_hostport},
+                    {'name': 'S3_USE_SSL', 'value': goat_s3_use_ssl | string},
+                    {'name': 'S3_URL_STYLE', 'value': goat_s3_url_style},
+                    {'name': 'S3_KEY', 'valueFrom': {'secretKeyRef': {'name': 'goat-s3-credentials', 'key': 'access_key'}}},
+                    {'name': 'S3_SECRET', 'valueFrom': {'secretKeyRef': {'name': 'goat-s3-credentials', 'key': 'secret_key'}}},
+                    {'name': 'BUCKET', 'value': goat_addon.s3.bucket},
+                    {'name': 'SCHEMA', 'value': 'ducklake'},
+                  ] + _ca_env }}"
+                # Explicit venv interpreter. The processes image builds
+                # into /venv (UV_PROJECT_ENVIRONMENT). Bare `python`
+                # may resolve to a system interpreter without duckdb.
+                command: ["/venv/bin/python"]
+                args: ["/scripts/init.py"]
+                volumeMounts: "{{ [
+                    {'name': 'script', 'mountPath': '/scripts', 'readOnly': True},
+                  ] + _ca_volume_mount }}"
+            volumes: "{{ [
+                {'name': 'script', 'configMap': {'name': 'ducklake-init-script'}},
+              ] + _ca_volume }}"
+
+- name: "GOAT addon: wait for DuckLake bootstrap Job"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: batch/v1
+    kind: Job
+    name: ducklake-init
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+    wait_condition:
+      type: Complete
+      status: "True"
+    wait_timeout: 300

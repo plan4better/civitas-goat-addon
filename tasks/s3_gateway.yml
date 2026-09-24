@@ -1,0 +1,135 @@
+---
+# Public `/<bucket>` S3 gateway. One Ingress on the GOAT host proxies
+# path-style requests to the resolved S3 endpoint, so the browser
+# origin equals the GOAT origin in both modes.
+
+# `/<bucket>` ingress path matches path-style SigV4, no rewrite.
+# Ingress backends must live in the same namespace, so an attached S3
+# endpoint is fronted by an ExternalName Service. Definition passed
+# as a block scalar so the k8s module parses ports as native ints
+# (jinja2 without jinja2_native stringifies ints in inline dicts).
+- name: GOAT addon create ExternalName service for attached S3
+  when: goat_addon.s3.mode == 'attach'
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    definition: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: goat-s3-upstream
+        namespace: {{ goat_addon.namespace }}
+        labels:
+          app.kubernetes.io/name: goat
+          app.kubernetes.io/part-of: goat
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      {% if inv_k8s.ingress_class == 'traefik' and (goat_s3_endpoint_is_tls | bool) %}
+        annotations:
+          # Traefik has no Ingress-level backend-protocol annotation.
+          # Scheme is per-Service. Internal-CA endpoints additionally
+          # need a ServersTransport CRD, out of scope here.
+          traefik.ingress.kubernetes.io/service.serversscheme: https
+      {% endif %}
+      spec:
+        type: ExternalName
+        externalName: {{ goat_s3_endpoint | urlsplit('hostname') }}
+        ports:
+          - name: api
+            port: {{ goat_s3_upstream_port }}
+            # Explicit. Some controllers treat unset targetPort as 0
+            # and fail with `Connection refused` against a healthy upstream.
+            targetPort: {{ goat_s3_upstream_port }}
+
+# Annotations for the `/<bucket>` Ingress. Broken out from the
+# Ingress definition so nginx-only keys stay conditional.
+#
+# backend-protocol. ingress-nginx defaults to HTTP. Sending plaintext
+# to an S3 HTTPS listener resets mid-request (502 to the browser).
+# upstream-vhost. SigV4 signs the request host. A fronting proxy
+# rewriting Host to the internal ingress name breaks every presigned
+# GET with SignatureDoesNotMatch.
+# proxy-ssl-name. Explicit SNI. Default resolves to `upstream_balancer`
+# under dynamic upstreams, which no S3 cert covers.
+#
+# `set_fact` preserves the dict type only when the whole value is a
+# single `{{ expr }}`. Do NOT use `>-` here.
+- name: GOAT addon build S3 ingress annotations for {{ inv_k8s.ingress_class }}
+  ansible.builtin.set_fact:
+    goat_s3_ingress_annotations: "{{ s3_base_annotations | combine(s3_nginx_annotations if inv_k8s.ingress_class == 'nginx' else {}) | combine(s3_nginx_vhost_annotation if (inv_k8s.ingress_class == 'nginx' and goat_s3_upstream_vhost | length > 0) else {}) | combine(s3_nginx_tls_annotations if (inv_k8s.ingress_class == 'nginx' and (goat_s3_endpoint_is_tls | bool)) else {}) }}"
+  vars:
+    # cert-manager.io/cluster-issuer intentionally omitted. The
+    # Certificate is owned by certificate.yml. Leaving it on made
+    # five reconcilers race for one Secret. kubernetes.io/ingress.class
+    # is omitted as deprecated and divergent from spec.ingressClassName.
+    s3_base_annotations: {}
+    s3_nginx_annotations:
+      # civitas convention. Clusters terminating TLS at the ingress
+      # redirect. Clusters with a fronting proxy skip to avoid a loop.
+      nginx.ingress.kubernetes.io/ssl-redirect: "{{ 'false' if (inv_k8s.ingress.http | default(false)) else 'true' }}"
+      nginx.ingress.kubernetes.io/whitelist-source-range: "{{ user_whitelist | default(['0.0.0.0/0']) | join(',') }}"
+      nginx.ingress.kubernetes.io/proxy-body-size: "{{ goat_addon.s3.proxy.max_body_size }}"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+      # ExternalName has no ClusterIP. Cluster-wide `service-upstream`
+      # would 502 every request looking for one. Pinned off here.
+      nginx.ingress.kubernetes.io/service-upstream: "false"
+      # Pinned "on" so streaming-configured controllers still surface
+      # early upstream 4xx (bad signature, quota, missing bucket)
+      # instead of nondeterministic 502s.
+      nginx.ingress.kubernetes.io/proxy-request-buffering: "on"
+      nginx.ingress.kubernetes.io/backend-protocol: "{{ 'HTTPS' if (goat_s3_endpoint_is_tls | bool) else 'HTTP' }}"
+    # Split out so `upstream_vhost: ""` can suppress the annotation
+    # entirely (a set-to-empty annotation would blank the Host header).
+    s3_nginx_vhost_annotation:
+      nginx.ingress.kubernetes.io/upstream-vhost: "{{ goat_s3_upstream_vhost }}"
+    s3_nginx_tls_annotations:
+      # No-op unless a `proxy-ssl-secret` (client-CA Secret) is
+      # provisioned separately. The addon does not create one.
+      nginx.ingress.kubernetes.io/proxy-ssl-verify: "{{ 'on' if (goat_addon.s3.proxy.ssl_verify | bool) else 'off' }}"
+      nginx.ingress.kubernetes.io/proxy-ssl-name: "{{ goat_s3_proxy_ssl_name }}"
+      nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
+
+# Kept in a set_fact so the int port stays typed correctly through
+# the k8s module (see comment on the ExternalName Service above).
+- name: GOAT addon build S3 ingress paths
+  ansible.builtin.set_fact:
+    goat_s3_ingress_paths:
+      - path: "{{ goat_s3_ingress_path }}"
+        pathType: Prefix
+        backend:
+          service:
+            name: "{{ 'minio' if goat_addon.s3.mode == 'provision' else 'goat-s3-upstream' }}"
+            # Named `api` port. Both Services expose it and resolve
+            # in either mode without stringifying the int.
+            port:
+              name: api
+
+- name: GOAT addon deploy S3 public ingress for browser uploads
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: goat-s3
+        namespace: "{{ goat_addon.namespace }}"
+        # `name` and `part-of` match the chart's four ingresses so
+        # `-l app.kubernetes.io/name=goat` selectors pick this up too.
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+          app.kubernetes.io/name: goat
+          app.kubernetes.io/part-of: goat
+        annotations: "{{ goat_s3_ingress_annotations }}"
+      spec:
+        ingressClassName: "{{ inv_k8s.ingress_class }}"
+        tls:
+          - hosts:
+              - "{{ goat_ingress_host }}"
+            secretName: "{{ goat_tls_secret }}"
+        rules:
+          - host: "{{ goat_ingress_host }}"
+            http:
+              paths: "{{ goat_s3_ingress_paths }}"

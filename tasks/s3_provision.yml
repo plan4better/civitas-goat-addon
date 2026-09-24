@@ -1,0 +1,161 @@
+---
+# Provision mode only (gated in tasks.yml). Single-replica MinIO
+# (server, PVC, service) plus the bucket-init Job.
+
+- name: GOAT addon deploy MinIO server, PVC and service
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: present
+    definition: "{{ item }}"
+  loop:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: minio-data
+        namespace: "{{ goat_addon.namespace }}"
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: "{{ inv_k8s.storage_class.loc | default('local-path') }}"
+        resources:
+          requests:
+            storage: 10Gi
+    - apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: minio
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app: minio
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate  # single-replica with RWO PVC. No rolling update.
+        selector:
+          matchLabels:
+            app: minio
+        template:
+          metadata:
+            labels:
+              app: minio
+          spec:
+            containers:
+              - name: minio
+                image: "{{ software.addon_goat.images.minio.registry }}/{{ software.addon_goat.images.minio.repository }}:{{ software.addon_goat.images.minio.tag }}"
+                imagePullPolicy: "{{ software.addon_goat.images.minio.pullPolicy | default('IfNotPresent') }}"
+                args: ["server", "--console-address", ":9001", "/data/s3"]
+                ports:
+                  - { name: api, containerPort: 9000 }
+                  - { name: console, containerPort: 9001 }
+                env:
+                  - name: MINIO_ROOT_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: goat-s3-credentials
+                        key: access_key
+                  - name: MINIO_ROOT_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: goat-s3-credentials
+                        key: secret_key
+                readinessProbe:
+                  httpGet: { path: /minio/health/ready, port: 9000 }
+                  periodSeconds: 5
+                volumeMounts:
+                  - { name: data, mountPath: /data }
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: minio-data
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        name: minio
+        namespace: "{{ goat_addon.namespace }}"
+      spec:
+        selector:
+          app: minio
+        ports:
+          - { name: api, port: 9000, targetPort: 9000 }
+          - { name: console, port: 9001, targetPort: 9001 }
+
+- name: GOAT addon wait for MinIO to be ready
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: apps/v1
+    kind: Deployment
+    name: minio
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+    wait_condition:
+      type: Available
+      status: "True"
+    wait_timeout: 180
+
+# `mc mb` is idempotent. The Job is recreated each run because Job
+# specs are immutable.
+- name: GOAT addon clean up prior bucket-init Job
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: goat-bucket-init
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+
+- name: GOAT addon create goat bucket in S3
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: goat-bucket-init
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        backoffLimit: 3
+        template:
+          spec:
+            restartPolicy: OnFailure
+            containers:
+              - name: mc
+                image: "{{ software.addon_goat.images.minio_mc.registry }}/{{ software.addon_goat.images.minio_mc.repository }}:{{ software.addon_goat.images.minio_mc.tag }}"
+                imagePullPolicy: "{{ software.addon_goat.images.minio_mc.pullPolicy | default('IfNotPresent') }}"
+                env:
+                  - name: MC_ENDPOINT
+                    value: "{{ goat_s3_endpoint }}"
+                  - name: MC_ACCESS_KEY
+                    valueFrom:
+                      secretKeyRef: { name: goat-s3-credentials, key: access_key }
+                  - name: MC_SECRET_KEY
+                    valueFrom:
+                      secretKeyRef: { name: goat-s3-credentials, key: secret_key }
+                command: ["/bin/sh", "-c"]
+                args:
+                  - |
+                    set -euo pipefail
+                    mc alias set goat "$MC_ENDPOINT" "$MC_ACCESS_KEY" "$MC_SECRET_KEY"
+                    mc mb --ignore-existing goat/{{ goat_addon.s3.bucket }}
+                    echo "bucket goat/{{ goat_addon.s3.bucket }} ready at $MC_ENDPOINT"
+
+- name: GOAT addon wait for bucket-init Job to complete
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: batch/v1
+    kind: Job
+    name: goat-bucket-init
+    namespace: "{{ goat_addon.namespace }}"
+    wait: true
+    wait_condition:
+      type: Complete
+      status: "True"
+    wait_timeout: 120
