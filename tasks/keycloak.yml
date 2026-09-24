@@ -507,11 +507,11 @@
       Accept: application/json
       Authorization: "Bearer {{ keycloak_login.json.access_token }}"
     status_code: 204
-  when: goat_kc_desired_overrides != goat_kc_current_overrides
+  # Keycloak keeps override keys that are missing from a PUT, so dropping
+  # `browser` from the map never unbinds the gate. An empty value does.
+  when: goat_kc_current_browser != goat_kc_desired_browser
   vars:
     goat_kc_current_overrides: "{{ goat_kc_client_rep.json.authenticationFlowBindingOverrides | default({}) }}"
-    goat_kc_desired_overrides: >-
-      {{ goat_kc_current_overrides | combine({'browser': goat_kc_flow_id})
-         if goat_addon.keycloak.limit_access | bool
-         else goat_kc_current_overrides | dict2items
-              | rejectattr('key', 'equalto', 'browser') | list | items2dict }}
+    goat_kc_current_browser: "{{ goat_kc_current_overrides.browser | default('') }}"
+    goat_kc_desired_browser: "{{ goat_kc_flow_id if goat_addon.keycloak.limit_access | bool else '' }}"
+    goat_kc_desired_overrides: "{{ goat_kc_current_overrides | combine({'browser': goat_kc_desired_browser}) }}"
