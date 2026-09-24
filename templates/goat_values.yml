@@ -344,6 +344,11 @@ web:
       # the browser replays as `invalid_grant (Code not valid)`.
       nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
       nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
+      # Set with the two above: nginx requires busy buffers < all buffers
+      # minus one (4 x 16k - 16k = 48k). Otherwise a controller-wide default
+      # (civitas sets proxy-busy-buffers-size: 128k) makes the generated
+      # config invalid and ingress-nginx stops reloading -- for every Ingress.
+      nginx.ingress.kubernetes.io/proxy-busy-buffers-size: "32k"
 {% else %}      {}
 {% endif %}    hosts:
       - host: "{{ goat_ingress_host }}"

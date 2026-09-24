@@ -33,12 +33,12 @@ inv_addons:
     #   windmill_db_name: "windmill"
     #   # Runtime Postgres endpoint. Defaults to the Zalando master
     #   # service. Override to route workloads elsewhere.
-    #   host: "central-db.{{ inv_central_db.ns_name }}.svc.cluster.local"
+    #   host: "central-db.<inv_central_db.ns_name>.svc.cluster.local"
     #   port: 5432
     #   # Per-service overrides. Default to `host` and `port`.
-    #   windmill_host: "central-db.{{ inv_central_db.ns_name }}.svc.cluster.local"
+    #   windmill_host: "central-db.<inv_central_db.ns_name>.svc.cluster.local"
     #   windmill_port: 5432
-    #   geoapi_host: "central-db.{{ inv_central_db.ns_name }}.svc.cluster.local"
+    #   geoapi_host: "central-db.<inv_central_db.ns_name>.svc.cluster.local"
     #   geoapi_port: 5432
     # keycloak:
     #   client_id: "goat-web"

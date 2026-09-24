@@ -108,9 +108,11 @@
     url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/clients/{{ client_id_goat }}"
     body_format: json
     ca_path: "{{ inv_k8s.ingress.ca_path }}"
+    # The template lookup returns a dict on some Ansible versions (2.18) and a
+    # JSON string on others (2.19): parse only when it is a string.
     body: >-
-      {{ lookup('template', playbook_dir + '/addons/goat_addon/templates/goat-keycloak-client.json.j2')
-         | from_json
+      {% set tpl = lookup('template', playbook_dir + '/addons/goat_addon/templates/goat-keycloak-client.json.j2') %}{{
+         (tpl if tpl is mapping else tpl | from_json)
          | combine({'authenticationFlowBindingOverrides':
                     goat_kc_client_before.json.authenticationFlowBindingOverrides | default({})}) }}
     headers:
