@@ -3,11 +3,11 @@
 # lookup('template') in-memory. `helm_values_rcombine` lets operators
 # override any key from `inv_addons.goat.helm_values` without forking.
 #
-# `helm_repo_name` and `helm_chart_version` are unset on purpose. The
-# wrapper takes its "install from reference" branch and runs
-# `helm install <name> <helm_chart_reference>` verbatim, defaulting
-# to the OCI URL. helm without --version resolves OCI to "latest".
-# A pre-fetched tgz override pins the version for now.
+# Chart version: an OCI reference (the default) is installed with
+# `--version {{ goat_addon.chart.version }}` -- without it helm resolves OCI to
+# the newest chart, whatever its values contract. A local .tgz path (offline
+# installs) pins itself, so it goes through the wrapper's local-chart branch
+# with no version. `helm_repo_name` stays unset either way.
 
 # Bitnami's bundled redis auto-generates a password on first install
 # and stores it in `goat-redis`. Subsequent `helm upgrade` runs refuse
@@ -34,8 +34,21 @@
     - existing_redis_secret.resources | length > 0
     - existing_redis_secret.resources[0].data['redis-password'] is defined
 
-- name: Helm create the GOAT installation
+- name: Helm create the GOAT installation (OCI chart, pinned version)
   ansible.builtin.include_tasks: tasks/templates/k8s-helm.yml
+  when: goat_addon.chart.ref is match('oci://')
+  vars:
+    helm_chart_name: "{{ software.addon_goat.helm_chart_name }}"
+    helm_release_name: "{{ software.addon_goat.helm_release_name }}"
+    helm_chart_reference: "{{ goat_addon.chart.ref }}"
+    helm_chart_version: "{{ goat_addon.chart.version }}"
+    helm_values_file: "{{ addon_dir | default('') }}templates/goat_values.yml"
+    helm_values_rcombine: "{{ (inv_addons.goat.helm_values | default({})) | combine(redis_password_override | default({}), recursive=True) }}"
+    helm_create_namespace: false
+
+- name: Helm create the GOAT installation (local chart archive)
+  ansible.builtin.include_tasks: tasks/templates/k8s-helm.yml
+  when: goat_addon.chart.ref is not match('oci://')
   vars:
     helm_chart_name: "{{ software.addon_goat.helm_chart_name }}"
     helm_release_name: "{{ software.addon_goat.helm_release_name }}"

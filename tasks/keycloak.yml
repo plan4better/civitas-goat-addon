@@ -81,6 +81,23 @@
   vars:
     query: "[?clientId== '{{ goat_addon.keycloak.client_id }}'].id | [0]"
 
+# The login gate's browser-flow binding lives on the client. The PUT below
+# sends the template, which has no binding, so carry the current one over:
+# otherwise a run that fails after the PUT would leave the gate unbound,
+# i.e. open to every user in the realm.
+- name: "GOAT addon: read current goat-web flow binding"
+  check_mode: no
+  uri:
+    method: GET
+    url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/clients/{{ client_id_goat }}"
+    return_content: yes
+    ca_path: "{{ inv_k8s.ingress.ca_path }}"
+    headers:
+      Accept: application/json
+      Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+    status_code: 200
+  register: goat_kc_client_before
+
 # PUT on every run so hostname, subdomain and public_url changes take
 # effect. POST-once-then-409 froze redirectUris at first create, and
 # any later change surfaced as `invalid parameter: redirect_uri`.
@@ -91,11 +108,74 @@
     url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/clients/{{ client_id_goat }}"
     body_format: json
     ca_path: "{{ inv_k8s.ingress.ca_path }}"
-    body: "{{ lookup('template', playbook_dir + '/addons/goat_addon/templates/goat-keycloak-client.json.j2') }}"
+    body: >-
+      {{ lookup('template', playbook_dir + '/addons/goat_addon/templates/goat-keycloak-client.json.j2')
+         | from_json
+         | combine({'authenticationFlowBindingOverrides':
+                    goat_kc_client_before.json.authenticationFlowBindingOverrides | default({})}) }}
     headers:
       Accept: application/json
       Authorization: "Bearer {{ keycloak_login.json.access_token }}"
     status_code: 204
+
+# core runs with AUTH on and uses this client's service account (client
+# credentials grant) to read users (profile enrichment) and to update or
+# delete them (profile edits, account deletion). That needs the
+# realm-management roles view-users and manage-users. Adding a mapping that
+# already exists is a no-op (204), so this is safe on every run.
+- name: "GOAT addon: service account roles for core"
+  block:
+    - name: "GOAT addon: get the goat-web service-account user"
+      check_mode: no
+      uri:
+        method: GET
+        url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/clients/{{ client_id_goat }}/service-account-user"
+        return_content: yes
+        ca_path: "{{ inv_k8s.ingress.ca_path }}"
+        headers:
+          Accept: application/json
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        status_code: 200
+      register: goat_kc_sa_user
+
+    - name: "GOAT addon: get the realm-management client"
+      check_mode: no
+      uri:
+        method: GET
+        url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/clients?clientId=realm-management"
+        return_content: yes
+        ca_path: "{{ inv_k8s.ingress.ca_path }}"
+        headers:
+          Accept: application/json
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        status_code: 200
+      register: goat_kc_realm_mgmt
+
+    - name: "GOAT addon: get the view-users and manage-users roles"
+      check_mode: no
+      uri:
+        method: GET
+        url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/clients/{{ goat_kc_realm_mgmt.json[0].id }}/roles/{{ item }}"
+        return_content: yes
+        ca_path: "{{ inv_k8s.ingress.ca_path }}"
+        headers:
+          Accept: application/json
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        status_code: 200
+      loop: ["view-users", "manage-users"]
+      register: goat_kc_mgmt_roles
+
+    - name: "GOAT addon: map view-users and manage-users onto the service account"
+      uri:
+        method: POST
+        url: "{{ inv_access.platform.hostname }}/admin/realms/{{ inv_access.tenant.realm_name }}/users/{{ goat_kc_sa_user.json.id }}/role-mappings/clients/{{ goat_kc_realm_mgmt.json[0].id }}"
+        body_format: json
+        ca_path: "{{ inv_k8s.ingress.ca_path }}"
+        body: "{{ goat_kc_mgmt_roles.results | map(attribute='json') | list }}"
+        headers:
+          Accept: application/json
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        status_code: 204
 
 - name: "GOAT addon: fetch goat-web client secret"
   check_mode: no

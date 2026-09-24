@@ -5,7 +5,7 @@ inv_addons:
   goat:
     enable: true
     # One pin for every plan4better/goat image.
-    release: "v3.0.2"
+    release: "v3.0.3"
     web:
       subdomain: "goat"
       # public_url: "https://goat.{{ DOMAIN }}"
@@ -27,7 +27,7 @@ inv_addons:
     # chart:                        # OCI pull from ghcr.io by default. Override
     #                               # ref to a local tgz for offline installs.
     #   ref: "oci://ghcr.io/plan4better/charts/goat"
-    #   version: "0.4.1"
+    #   version: "0.5.1"
     # db:
     #   goat_db_name: "goat"
     #   windmill_db_name: "windmill"
@@ -53,5 +53,3 @@ inv_addons:
     #   pvc_size: "20Gi"
     #   pvc_access_mode: "ReadWriteOnce"
     #   storage_class: "nfs-client"
-    # ingress:
-    #   traefik_api_group: "traefik.containo.us/v1alpha1"   # Traefik v2

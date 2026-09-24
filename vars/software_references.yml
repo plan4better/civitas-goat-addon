@@ -14,14 +14,14 @@
 # references it, and nesting the shared value in the same dict as its
 # consumers triggers `recursive loop detected in template string` when
 # the whole dict is templated (e.g. from an assert).
-goat_release: "{{ inv_addons.goat.release | default('v3.0.2') }}"
+goat_release: "{{ inv_addons.goat.release | default('v3.0.3') }}"
 
 software:
   addon_goat:
     helm_chart_name: goat
     helm_release_name: goat
     helm_repo_url: oci://ghcr.io/plan4better/charts
-    helm_chart_version: "0.4.1"
+    helm_chart_version: "0.5.1"
 
     # Chart-deployed images are consumed by the chart via
     # `<svc>.image.{registry,repository,tag,pullPolicy}` in
@@ -45,6 +45,11 @@ software:
       processes:
         registry: ghcr.io
         repository: plan4better/goat/processes
+        tag: "{{ goat_release }}"
+        pullPolicy: IfNotPresent
+      catalog:
+        registry: ghcr.io
+        repository: plan4better/goat/catalog
         tag: "{{ goat_release }}"
         pullPolicy: IfNotPresent
       windmill_server:

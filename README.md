@@ -4,13 +4,13 @@
 
 ## Status
 
-Installs the GOAT Helm chart (`oci://ghcr.io/plan4better/charts/goat` v0.4.x) into civitas with:
+Installs the GOAT Helm chart (`oci://ghcr.io/plan4better/charts/goat` v0.5.x, GOAT v3.0.3+) into civitas with:
 
 - `<env>-goat-stack` namespace + civitas CA mirroring
 - `goat` + `windmill` databases provisioned in civitas's central-db (Zalando `preparedDatabases` patch)
 - Keycloak `goat-web` OIDC client in the civitas realm (idempotent)
-- MinIO deployment + bucket + DuckLake catalog bootstrap (or attached to an existing S3 endpoint — see [External S3](#external-s3-compatible-object-storage))
-- Helm install of GOAT (core, web, geoapi, processes, windmill server + 4 workers, redis)
+- MinIO deployment + bucket (or attached to an existing S3 endpoint — see [External S3](#external-s3-compatible-object-storage)) and the shared data volume
+- Helm install of GOAT (core, web, geoapi, processes, catalog, windmill server + 4 workers, redis), authenticated against the civitas realm — see [Authentication](#authentication)
 - All GOAT images pinned to a single release tag (`inv_addons.goat.release`) — see [Versioning](#versioning)
 
 ## Routing
@@ -25,36 +25,17 @@ The browser-facing URL (`web.public_url`, default `https://<subdomain>.<DOMAIN>`
 |-----------------|------------------|------------------------------------------------------------------------------------------|
 | `/`             | goat-web         | host root, no rewrite (Next.js `basePath` is build-time)                                 |
 | `/core`         | goat-core        | `API_V2_STR="/core/api/v2"` carries the prefix, no rewrite                               |
-| `/geoapi`       | geoapi           | prefix stripped via ingress profile (nginx: `rewrite-target`; traefik: `stripPrefix` MW) |
-| `/processes`    | processes        | prefix stripped via ingress profile (nginx: `rewrite-target`; traefik: `stripPrefix` MW) |
+| `/geoapi`       | geoapi           | `ROOT_PATH=/geoapi`, no rewrite                                                          |
+| `/processes`    | processes        | `ROOT_PATH=/processes`, no rewrite                                                       |
+| `/catalog`      | catalog          | `ROOT_PATH=/catalog`, no rewrite (STAC API at `/catalog/stac`)                           |
 | `/<bucket>`     | S3 gateway       | path prefix equals bucket name (SigV4 constraint) — no rewrite                           |
 | —               | windmill         | no public ingress; `processes` reaches it in-cluster                                     |
 
-### Supported ingress controllers
+### Ingress controllers
 
-Selected by `inv_k8s.ingress_class`; a startup `assert` fails cleanly if the value has no matching profile.
+Every service serves under its own prefix (`API_V2_STR` for core, `ROOT_PATH` for geoapi, processes and catalog, GOAT v3.0.3+), so all Ingresses are plain `pathType: Prefix` paths with no rewrite annotations or middleware, on any controller. The services also build their OGC/STAC `self`/`next` links and API docs with the prefix, so external clients (QGIS, STAC browsers) can follow them.
 
-| `inv_k8s.ingress_class` | Prefix-strip for geoapi/processes | Extra operator setup |
-|---|---|---|
-| `nginx`   | `nginx.ingress.kubernetes.io/rewrite-target` annotation | none |
-| `traefik` | Per-service `stripPrefix` `Middleware` CRD (`tasks/ingress_middleware.yml`) | HTTPS-redirect must be configured at the Traefik entrypoint (or via a `redirectScheme` middleware) — the `nginx.ingress.kubernetes.io/ssl-redirect` annotation is silently ignored on Traefik |
-
-Traefik Middleware API group defaults to `traefik.io/v1alpha1` (Traefik v3). For Traefik v2 clusters, override:
-
-```yaml
-inv_addons:
-  goat:
-    ingress:
-      traefik_api_group: "traefik.containo.us/v1alpha1"
-```
-
-Adding a third controller (e.g. APISIX) is additive: add a profile block under `goat_addon.ingress.profiles.<class>` in `vars/default.yml`, wire whatever per-service CRDs it needs, and the assert stops failing. Do not add elif branches in the template.
-
-### Strategic note — this abstraction is temporary
-
-The profile map exists **only** because geoapi and processes do not support FastAPI's `root_path`. If the upstream `ROOT_PATH` change lands in `plan4better/goat`, both services can serve under their own prefix like goat-core already does — at which point the profile map, the Middleware CRDs, and every controller-conditional annotation can be deleted in favour of plain `pathType: Prefix` paths with no annotations on any controller. Treat any additions to this layer as debt.
-
-**Accepted trade-offs.** geoapi/processes emit OGC/HATEOAS/TileJSON absolute URLs from `request.base_url` that omit the `/geoapi` or `/processes` prefix. The GOAT UI does not consume those URLs (it composes every backend URL itself from `NEXT_PUBLIC_*`), so this only affects external clients pointing directly at those endpoints. Similarly, `/geoapi/api/docs` and `/processes/api/docs` cannot fetch their spec (`openapi_url` is hardcoded to `/api/openapi.json`), though the raw JSON stays reachable.
+On Traefik, the `nginx.ingress.kubernetes.io/*` annotations are not emitted; configure the HTTPS redirect at the Traefik entrypoint (or via a `redirectScheme` middleware).
 
 ## Versioning
 
@@ -63,13 +44,13 @@ Every image built from the `plan4better/goat` monorepo pins to a single release 
 ```yaml
 inv_addons:
   goat:
-    release: "v2.4.60"   # applies to core / web / geoapi / processes /
+    release: "v3.0.3"    # applies to core / web / geoapi / processes / catalog /
                          # windmill-server / windmill-worker-{default,tools,print}
 ```
 
 **Why they move together.** `geoapi`, `processes` and `windmill-worker-tools` share a DuckLake catalog through a Postgres schema; the DuckDB extension baked into each image writes the catalog's on-disk format, so a version skew across services produces `DuckLake catalog version mismatch` at attach time. `core` does not use DuckDB (delegates DuckLake to geoapi over HTTP), but is pinned for API compatibility. Non-GOAT images (`redis`, `minio`, `minio_mc`) are pinned independently in `vars/software_references.yml`.
 
-The DuckLake bootstrap Job (`tasks/ducklake.yml`) runs from the `processes` image and uses `AUTOMATIC_MIGRATION TRUE` on ATTACH, so it can upgrade an older catalog to the current release's format. This is the *only* place a catalog upgrade can happen — goatlib's runtime attach hardcodes its option list.
+The DuckLake catalog is created by the chart: an init container on geoapi and processes runs goatlib's idempotent bootstrap from the same image the services run, so the catalog format always matches. A catalog *format* upgrade between DuckLake versions is one-way and is not done automatically; follow the GOAT release notes when one is announced.
 
 ## Inventory
 
@@ -80,10 +61,11 @@ inv_addons:
   goat:
     enable: true
     namespace: "{{ ENVIRONMENT }}-goat-stack"
-    release: "v2.4.60"
+    release: "v3.0.3"
     chart:
+      # OCI refs are installed with --version; a local .tgz path pins itself.
       ref: "oci://ghcr.io/plan4better/charts/goat"
-      version: "0.4.1"
+      version: "0.5.1"
     db:
       # Optional — Postgres database names. Defaults shown.
       # Override only if you need to co-tenant multiple goat installs in
@@ -110,9 +92,6 @@ inv_addons:
       gate_group: "goat-users"
       flow_alias: "goat-browser"
       deny_message: "Ihr Benutzerkonto ist nicht für GOAT freigeschaltet. Bitte wenden Sie sich an Ihre Administration."
-    ingress:
-      # Traefik v2 clusters only — see "Supported ingress controllers".
-      traefik_api_group: "traefik.io/v1alpha1"
     web:
       # Base subdomain. Composed with DOMAIN / INGRESS_DOMAIN to yield the
       # ingress host and the public URL — see "Routing".
@@ -197,15 +176,15 @@ inv_addons:
 
 **Browser-facing endpoint = public GOAT URL, always.** There is no `public_endpoint` variable to set. In both modes the addon deploys a `/<bucket>` Ingress on the public GOAT host; presigned URLs returned by goat-core embed that URL as `S3_PUBLIC_ENDPOINT_URL`. In `provision` mode the Ingress backend is the addon-deployed MinIO Service; in `attach` mode it is a namespace-local `ExternalName` Service (`goat-s3-upstream`) that resolves to `endpoint`. This keeps the browser origin equal to the GOAT origin — no second host to cover with a TLS cert, no cross-origin CORS surface.
 
-Preconditions (attach mode asserts only that `endpoint`, `access_key` and `secret_key` are non-empty — there is no reachability or bucket-existence preflight, so a wrong endpoint, wrong credentials or a missing bucket surfaces at the DuckLake init Job, not at addon start):
+Preconditions (attach mode asserts only that `endpoint`, `access_key` and `secret_key` are non-empty — there is no reachability or bucket-existence preflight, so a wrong endpoint, wrong credentials or a missing bucket surfaces at the first upload, not at addon start):
 
 1. **`access_key` + `secret_key` supplied** via inventory (source them from ansible-vault under `secrets.inv_addons.goat.s3_access_key` / `s3_secret_key`). The addon materializes them into a `goat-s3-credentials` Secret in the goat namespace on every run — no manual `kubectl create secret` step and no cross-namespace secret references. If your credentials live in a Secret elsewhere, copy the values into the vault once; the addon owns the in-namespace Secret from then on.
-2. **Bucket** identified by `s3.bucket` **already exists** at the endpoint. The addon skips its `goat-bucket-init` Job in attach mode — attached credentials are typically scoped to a specific bucket without `s3:CreateBucket`, and the bucket is provisioned by the operator (Terraform, cloud console, `mc mb`, etc.) before the playbook runs. The credentials must have `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and `s3:ListBucket` on this bucket — DuckLake-init writes catalog metadata to it on every run.
+2. **Bucket** identified by `s3.bucket` **already exists** at the endpoint. The addon skips its `goat-bucket-init` Job in attach mode — attached credentials are typically scoped to a specific bucket without `s3:CreateBucket`, and the bucket is provisioned by the operator (Terraform, cloud console, `mc mb`, etc.) before the playbook runs. The credentials must have `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and `s3:ListBucket` on this bucket (uploads, prints and thumbnails are stored there).
 3. **`endpoint`** is reachable from the goat namespace (in-cluster DNS or public network). Used by boto3 / DuckDB / `mc` inside pods, and by the `goat-s3-upstream` `ExternalName` Service (a plain DNS alias — `endpoint` must be a hostname, not an IP literal). Operator-side firewall rules must permit egress from the goat namespace to the storage host; the addon does not test reachability.
 4. **`region`** matches how SigV4 is signed on the target. Both MinIO and Dell ECS verify it, so it must match whatever the endpoint advertises.
 5. **CORS at the storage backend.** Because the browser talks to the S3 via the `/<bucket>` path on the public GOAT host, the presigned request looks (to the pod that ultimately handles it) like `Host: <public GOAT host>` — this is set explicitly through `nginx.ingress.kubernetes.io/upstream-vhost` so SigV4 validates. If the attached S3 enforces a CORS allow-list on the request `Origin`, the operator must add the public GOAT origin (`https://<subdomain>.<DOMAIN>`) to it. Symptom when missing: uploads fail with an opaque CORS error against a healthy backend. Out of scope for the addon.
 
-**DuckLake catalog binding.** The DuckLake catalog metadata (Postgres `ducklake.*` tables) stores the S3 endpoint written at bootstrap. Switching `endpoint` on an existing install leaves the catalog pointing at the old location; the addon's DuckLake init sets `AUTOMATIC_MIGRATION TRUE` on ATTACH which handles catalog *format* upgrades, but not endpoint relocation. Treat endpoint changes as a re-bootstrap.
+**Layer data is not in S3.** The DuckLake catalog lives in Postgres (`ducklake.*`), and its parquet files — every user layer — live on the shared data volume `goat-ducklake-data` (`/app/data/ducklake`), not in the bucket. Back that volume up and size it for the layer data; `inv_addons.goat.ducklake.pvc_size` defaults to 20Gi.
 
 **Cost of leftover state.** Switching from `provision` → `attach` does not delete the in-cluster MinIO Deployment/PVC/Service if they already exist from a prior run (the `goat-s3` Ingress exists in both modes and is updated in place). Delete manually (`kubectl -n <env>-goat-stack delete deploy,svc,pvc minio minio-data`) to reclaim the disk.
 
@@ -239,6 +218,29 @@ Notes and caveats:
 Invite first. A user who logs in without a pending invitation is prompted to create an own organization, which cannot be undone without deleting the user (see open mode above).
 
 **Offboarding runbook.** Removing a user from the gate group does not end active sessions. The gate runs at authentication time only. Remove the user from the group and sign out their sessions in Keycloak (user, Sessions, Sign out).
+
+## Authentication
+
+`global.auth` is on: core, web, geoapi, processes and catalog all validate Keycloak tokens from the civitas realm, read from the `goat-keycloak-creds` Secret that `tasks/keycloak.yml` writes. core also uses the `goat-web` client's **service account** to read and update users (profile enrichment, profile edits, account deletion); the addon enables it and maps the realm-management roles `view-users` and `manage-users` onto it on every run.
+
+Check after an install: `kubectl -n <ns> exec deploy/goat-core -- printenv AUTH` prints `true`, and an API call without a token (e.g. `curl -i https://<host>/core/api/v2/users/profile`) answers `401`.
+
+## Routing base data (street network, public transport)
+
+Heatmaps, catchments and the PT tools read their base data from the shared volume. GOAT v3.0.3+ ships the Windmill task `f/goat/tasks/sync_base_data` for it; run it once from the Windmill UI (the weekly schedule is created switched off):
+
+- **With internet access:** the default source is `https://goat-base-data.plan4better.de/`. Limit it to your region, e.g. arguments `{"bbox": [6.9, 50.6, 7.3, 50.8]}` (Bonn: ~2.6 GB instead of the full data set).
+- **Air-gapped:** build a copy on any machine with internet access, upload it to your bucket, and point the task at it. The worker's own `S3_*` settings (and `AWS_CA_BUNDLE`) are used:
+
+  ```sh
+  docker run --rm --entrypoint /venv/bin/python -v "$PWD:/out" \
+    ghcr.io/plan4better/goat/windmill-worker-tools:v3.0.3 \
+    -m goatlib.tasks.sync_base_data mirror --to /out/goat-base-data --bbox=6.9,50.6,7.3,50.8
+  # upload ./goat-base-data to the bucket, e.g. under goat/goat-base-data/, then run the task with
+  #   {"sources": [{"url": "s3://goat/goat-base-data/"}]}
+  ```
+
+The task verifies every file (sha256), switches versions in one step and keeps the previous version; re-running it downloads nothing once current.
 
 ## How to use
 
@@ -274,7 +276,8 @@ ansible-playbook -i cc_cli_inventory.yml core_platform/playbook.yml \
 
 | addon | civitas-core | GOAT chart | GOAT release |
 |---|---|---|---|
-| **current** | v1.7.x+ | v0.4.x | v2.4.60 |
+| **current** | v1.7.x+ | v0.5.1 | v3.0.3 |
+| v0.3.0      | v1.7.x+ | v0.4.x | v2.4.60 |
 | v0.2.0      | v1.5.x+ | v0.3.x | mixed (`latest` / `f59d1e3` / `v2.4.36`) |
 | v0.1.x      | v1.5.x+ | v0.1.x |  |
 
@@ -295,9 +298,9 @@ yq '.software.addon_goat.images[] | "\(.registry)/\(.repository):\(.tag)"' \
 
 - **`subdomain` and `web.public_url` are load-bearing across the whole stack**: `inv_addons.goat.web.subdomain` composes the ingress-visible hostname (`<subdomain>.<INGRESS_DOMAIN>`) and the browser-facing URL (`https://<subdomain>.<DOMAIN>`); `web.public_url` optionally overrides the latter. Together they drive every `NEXT_PUBLIC_*` env baked into the goat-web bundle, `CLIENT_URL` on goat-core, the Keycloak `redirectUris` / `webOrigins` / `postLogoutRedirectUris`, and `S3_PUBLIC_ENDPOINT_URL`. The ingress name must resolve to the ingress load balancer — DNS record and cluster-issuer both have to agree. Changing subdomain or domain rotates the addon into a new host-derived TLS secret (`<ingress-host>-tls`); the OLD secret lingers in the namespace after the change and should be deleted manually to reclaim quota. The Keycloak client is PUT on every run against the same URL template, so hostname changes now propagate to `redirectUris` immediately — no more `invalid parameter: redirect_uri` after a rename.
 
-- **The `cacert` mount and CA env vars are conditional on `inv_k8s.ingress.ca_path`**: the `NODE_EXTRA_CA_CERTS` (web) and `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` (geoapi, processes) env vars, together with the `cacert` `extraVolumes` / `extraVolumeMounts` on those three services, are only rendered when `inv_k8s.ingress.ca_path` is set — the same condition that gates the `cacert` ConfigMap in `tasks/namespace.yml`. On clusters that use an ACME-issued certificate (chain trusted by the Node / OpenSSL default store), leave `ca_path` unset and no bundle is mounted. Previously the env vars were always emitted and goat-web logged `Warning: Ignoring extra certs from /etc/ssl/cacert/cacert.crt … No such file or directory` at every start. Do NOT substitute `kube-root-ca.crt`: that ConfigMap signs `kubernetes.default.svc`, not the public ingress cert, and is useless as a trust anchor for outbound HTTPS.
+- **The `cacert` mount and CA env vars are conditional on `inv_k8s.ingress.ca_path`**: the `NODE_EXTRA_CA_CERTS` (web) and `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` (geoapi, processes) env vars, together with the `cacert` `extraVolumes` / `extraVolumeMounts` on those services (core and catalog too — with auth on, every Python service fetches Keycloak's keys over HTTPS), are only rendered when `inv_k8s.ingress.ca_path` is set — the same condition that gates the `cacert` ConfigMap in `tasks/namespace.yml`. On clusters that use an ACME-issued certificate (chain trusted by the Node / OpenSSL default store), leave `ca_path` unset and no bundle is mounted. Previously the env vars were always emitted and goat-web logged `Warning: Ignoring extra certs from /etc/ssl/cacert/cacert.crt … No such file or directory` at every start. Do NOT substitute `kube-root-ca.crt`: that ConfigMap signs `kubernetes.default.svc`, not the public ingress cert, and is useless as a trust anchor for outbound HTTPS.
 
-- **`inv_addons.goat.s3.customCACert` adds an external S3 CA to the same `cacert` ConfigMap**: attach-mode S3 endpoints served by a private CA cause `CERTIFICATE_VERIFY_FAILED` in every pod-side boto3 and DuckDB httpfs client. Set `inv_addons.goat.s3.customCACert` to a PEM path on the Ansible controller. The content is concatenated with `inv_k8s.ingress.ca_path` (if set) into the `cacert` ConfigMap and mounted on goat-core, geoapi, processes, the windmill `tools` and `workflows` workers, and the `ducklake-init` Job. Those pods receive `AWS_CA_BUNDLE` and `CURL_CA_BUNDLE` pointing at `/etc/ssl/cacert/cacert.crt`; the init Job additionally issues `SET s3_ca_bundle_path` in DuckDB. `WHITELIST_ENVS` on the windmill workers includes both variable names so subprocess user scripts inherit them.
+- **`inv_addons.goat.s3.customCACert` adds an external S3 CA to the same `cacert` ConfigMap**: attach-mode S3 endpoints served by a private CA cause `CERTIFICATE_VERIFY_FAILED` in every pod-side boto3 and DuckDB httpfs client. Set `inv_addons.goat.s3.customCACert` to a PEM path on the Ansible controller. The content is concatenated with `inv_k8s.ingress.ca_path` (if set) into the `cacert` ConfigMap and mounted on goat-core, geoapi, processes and the windmill `tools` and `workflows` workers. Those pods receive `AWS_CA_BUNDLE` and `CURL_CA_BUNDLE` pointing at `/etc/ssl/cacert/cacert.crt`. `WHITELIST_ENVS` on the windmill workers includes both variable names so subprocess user scripts inherit them.
 
 - **`goat-web` server-side fetches hairpin through the ingress**: the Next.js server calls `NEXT_PUBLIC_API_URL` from inside the pod (SSR of the org-creation flow), which routes back out through the same ingress that serves the browser. Until a valid cert is served on the ingress host, Node rejects the chain with `SELF_SIGNED_CERT_IN_CHAIN` and the UI silently loops on the organization-creation screen — no error in the browser console, no HTTP error visible to the user, just an endless refresh (the POST to `/organizations` on the second attempt then answers `{"detail":"User has already an organization"}` even though the frontend never got the first response). Confirm the cert served on the ingress host is trusted by the goat-web pod (`NODE_EXTRA_CA_CERTS` mounts the civitas CA bundle from `inv_k8s.ingress.ca_path` — set that in inventory when the ingress cert chains up through a private CA; a real ACME cert needs no extra bundle).
 

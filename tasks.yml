@@ -11,12 +11,6 @@
       include_vars:
         dir: vars
 
-    # geoapi and processes need controller-specific prefix stripping.
-    # Without a matching profile they fall through to the `/` catch-all.
-    - name: "GOAT addon: assert ingress class is supported by the profile map"
-      ansible.builtin.assert:
-        that: inv_k8s.ingress_class in goat_addon.ingress.profiles
-
     - name: "GOAT addon: create namespace and mirror the civitas CA"
       ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/namespace.yml"
 
@@ -43,7 +37,7 @@
 
     # Last S3 consumer. The bootstrap Job needs the resolved endpoint,
     # the credentials Secret and (in provision mode) the created bucket.
-    - name: "GOAT addon: DuckLake volume and catalog bootstrap"
+    - name: "GOAT addon: shared data volume"
       ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/ducklake.yml"
 
     - name: "GOAT addon: configure Keycloak client"
@@ -52,15 +46,9 @@
     - name: "GOAT addon: helm install"
       ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/helm_install.yml"
 
-    # Traefik-only stripPrefix Middleware CRDs. `include_tasks` so the
-    # `when:` gate short-circuits the file load on other controllers.
-    - name: "GOAT addon: Traefik-only create stripPrefix Middleware CRDs"
-      ansible.builtin.include_tasks: "{{ addon_dir | default('') }}tasks/ingress_middleware.yml"
-      when: inv_k8s.ingress_class == 'traefik'
-
-    # Handled by the chart's own post-install hooks (no addon tasks).
-    # windmill workspace, admin password and API token.
-    # DuckLake catalog ATTACH.
+    # Handled by the chart itself (no addon tasks).
+    # windmill workspace, admin password and API token (post-install hook).
+    # DuckLake catalog bootstrap (init containers on geoapi/processes).
     # windmill workspace variables (POSTGRES_*, S3_*, ...).
     # alembic upgrade and initial_data.
 

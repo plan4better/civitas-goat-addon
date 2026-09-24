@@ -1,11 +1,14 @@
 # Rendered in-memory by tasks/templates/k8s-helm.yml (via helm_install.yml)
-# and passed to `helm install` as a values file.
+# and passed to `helm install` as a values file. Written for GOAT chart
+# 0.5.x / GOAT >= v3.0.3.
 #
-# Path map (all rooted on the ingress-host).
-#   /            goat-web        no rewrite
-#   /core        goat-core       API_V2_STR carries the prefix, no rewrite
-#   /geoapi      geoapi          nginx rewrite or traefik middleware
-#   /processes   processes       nginx rewrite or traefik middleware
+# Path map (all rooted on the ingress-host). No controller rewrites anything:
+# every service knows its own prefix and serves under it.
+#   /            goat-web        host root
+#   /core        goat-core       API_V2_STR carries the prefix
+#   /geoapi      geoapi          ROOT_PATH=/geoapi
+#   /processes   processes       ROOT_PATH=/processes
+#   /catalog     catalog         ROOT_PATH=/catalog (STAC API at /catalog/stac)
 #   /<bucket>    S3 gateway (s3_gateway.yml). MUST equal the bucket
 #                name for path-style SigV4, no rewrite.
 #   windmill has no public ingress. processes reaches it in-cluster only.
@@ -18,11 +21,31 @@
 {%- set s3_internal_endpoint = goat_s3_endpoint %}
 {%- set s3_public_endpoint = goat_public_url %}
 {%- set s3_region = _s3.region %}
-{%- set ingress_profile = goat_addon.ingress.profiles[inv_k8s.ingress_class] %}
 {%- set is_nginx = inv_k8s.ingress_class == 'nginx' %}
 {#- civitas convention. http=false (redirect on) for TLS-terminating
     ingresses. http=true (skip) when a fronting proxy already terminates. #}
 {%- set ssl_redirect = 'false' if (inv_k8s.ingress.http | default(false)) else 'true' %}
+{#- Two sources feed the one `cacert` ConfigMap (namespace.yml): the ingress /
+    Keycloak CA and the external S3 CA. #}
+{%- set has_ingress_ca = (inv_k8s.ingress.ca_path | default('')) != '' %}
+{%- set has_s3_ca = _s3.customCACert != '' %}
+{%- set has_cacert = has_ingress_ca or has_s3_ca %}
+{#- Windmill hands job subprocesses only the env vars listed here. This is the
+    chart 0.5.x default (keep it in sync when the chart changes it) plus what
+    this addon adds: CUSTOMER_SCHEMA, the baked DuckDB extension dir and the
+    CA bundles. #}
+{%- set worker_whitelist_envs = [
+      'MAX_UPLOAD_DATASET_FILE_SIZE', 'POSTGRES_SERVER', 'POSTGRES_PORT', 'POSTGRES_USER',
+      'POSTGRES_PASSWORD', 'POSTGRES_DB', 'POSTGRES_DATABASE_URI', 'DUCKLAKE_DATA_DIR',
+      'DUCKLAKE_CATALOG_SCHEMA', 'TILES_DATA_DIR', 'DATA_DIR', 'S3_PROVIDER',
+      'S3_FORCE_PATH_STYLE', 'S3_ENDPOINT_URL', 'S3_PUBLIC_ENDPOINT_URL', 'S3_ACCESS_KEY_ID',
+      'S3_SECRET_ACCESS_KEY', 'S3_BUCKET_NAME', 'S3_REGION', 'CATALOG_S3_BUCKET',
+      'CATALOG_S3_ENDPOINT_URL', 'CATALOG_S3_ACCESS_KEY_ID', 'CATALOG_S3_SECRET_ACCESS_KEY',
+      'CATALOG_S3_REGION', 'OD_MATRIX_BASE_PATH', 'STREET_NETWORK_EDGES_BASE_PATH',
+      'STREET_NETWORK_NODES_BASE_PATH', 'PT_NETWORK_BASE_PATH', 'GTFS_DATA_PATH',
+      'GEOCODING_URL', 'GEOCODING_AUTHORIZATION',
+      'CUSTOMER_SCHEMA', 'DUCKDB_EXTENSION_DIRECTORY', 'AWS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+    ] | join(',') %}
 
 global:
   # inv_k8s.storage_class is a dict ({loc, rwo, rwx}). The chart wants
@@ -32,6 +55,22 @@ global:
   commonLabels:
     civitas.core/owner: goat-addon
     civitas.core/env: "{{ ENVIRONMENT }}"
+  # One auth switch for core, web, geoapi, processes and catalog. Every
+  # service validates tokens against the civitas realm; the Keycloak client
+  # and this Secret (server-url, realm, client-id, client-secret,
+  # nextauth-secret) come from keycloak.yml. core additionally uses the
+  # client's service account (realm-management view-users + manage-users)
+  # to read and update users.
+  auth:
+    enabled: true
+    existingSecret: goat-keycloak-creds
+
+# One shared volume at /app/data for geoapi, processes, catalog, core and the
+# tools/workflows workers: DuckLake parquet (every user layer lives HERE, not
+# in S3), the catalog mirror, geoip and the routing base data. The claim is
+# created by ducklake.yml; back it up and size it for the layer data.
+data:
+  existingClaim: goat-ducklake-data
 
 {#- Image refs come from software_references.yml. The macro renders an
     `image:` block indented as a 2-space child of a top-level chart key. #}
@@ -41,6 +80,55 @@ image:
     repository: "{{ software.addon_goat.images[svc].repository }}"
     tag: "{{ software.addon_goat.images[svc].tag }}"
     pullPolicy: "{{ software.addon_goat.images[svc].pullPolicy | default('Always') }}"
+{%- endmacro %}
+
+{#- Ingress for a path-prefixed API service. The service sets ROOT_PATH to the
+    same prefix, so no rewrite annotation or Traefik middleware is needed. #}
+{%- macro api_ingress(prefix) -%}
+ingress:
+    enabled: true
+    className: "{{ inv_k8s.ingress_class }}"
+    annotations:
+{% if is_nginx %}      nginx.ingress.kubernetes.io/ssl-redirect: "{{ ssl_redirect }}"
+      nginx.ingress.kubernetes.io/whitelist-source-range: "{{ user_whitelist | default(['0.0.0.0/0']) | join(',') }}"
+{% else %}      {}
+{% endif %}    hosts:
+      - host: "{{ goat_ingress_host }}"
+        paths:
+          - path: "{{ prefix }}"
+            pathType: Prefix
+    tls:
+      - secretName: "{{ goat_tls_secret }}"
+        hosts:
+          - "{{ goat_ingress_host }}"
+{%- endmacro %}
+
+{#- CA trust for a Python service: REQUESTS_CA_BUNDLE/SSL_CERT_FILE for
+    Keycloak (token validation, core's admin client), AWS_/CURL_CA_BUNDLE for
+    the external S3. Renders `extraEnv` items (without the key). #}
+{%- macro ca_env() -%}
+{% if has_ingress_ca %}    - name: REQUESTS_CA_BUNDLE
+      value: /etc/ssl/cacert/cacert.crt
+    - name: SSL_CERT_FILE
+      value: /etc/ssl/cacert/cacert.crt
+{% endif %}{% if has_s3_ca %}    - name: AWS_CA_BUNDLE
+      value: /etc/ssl/cacert/cacert.crt
+    - name: CURL_CA_BUNDLE
+      value: /etc/ssl/cacert/cacert.crt
+{% endif %}
+{%- endmacro %}
+
+{%- macro ca_volumes() -%}
+{% if has_cacert %}  extraVolumes:
+    - name: cacert
+      configMap:
+        name: cacert
+        optional: true
+  extraVolumeMounts:
+    - name: cacert
+      mountPath: /etc/ssl/cacert
+      readOnly: true
+{% endif %}
 {%- endmacro %}
 
 core:
@@ -55,6 +143,7 @@ core:
     annotations:
 {% if is_nginx %}      nginx.ingress.kubernetes.io/ssl-redirect: "{{ ssl_redirect }}"
       nginx.ingress.kubernetes.io/whitelist-source-range: "{{ user_whitelist | default(['0.0.0.0/0']) | join(',') }}"
+{% else %}      {}
 {% endif %}    hosts:
       - host: "{{ goat_ingress_host }}"
         paths:
@@ -64,14 +153,6 @@ core:
       - secretName: "{{ goat_tls_secret }}"
         hosts:
           - "{{ goat_ingress_host }}"
-  # AUTH=false. goat-core serves all data as the single default
-  # identity (seeded by the chart migrate hook). goat-web's NextAuth
-  # still gates UI sign-in via Keycloak. Flipping to true switches to
-  # real multi-user mode and additionally requires enabling the
-  # Keycloak client service account with the realm `view-users` role.
-  auth:
-    enabled: false
-    existingSecret: goat-keycloak-creds
   # The chart's placeholder S3 values leak through if not overridden.
   # S3_PUBLIC_ENDPOINT_URL is substituted into presigned URLs returned
   # to the browser. Must be HTTPS to avoid mixed-content blocking.
@@ -85,6 +166,8 @@ core:
     S3_REGION: "{{ s3_region }}"
     S3_BUCKET_NAME: "{{ goat_addon.s3.bucket }}"
     S3_FORCE_PATH_STYLE: "true"
+    # No cloud metadata service here: stop boto3 probing 169.254.169.254.
+    AWS_EC2_METADATA_DISABLED: "true"
     # Default plan + quotas feed SELF_HOSTED_PLAN_METADATA in
     # crud_organization.py. STRIPE_SECRET_KEY MUST stay unset —
     # setting it flips every new org into a 14-day Stripe trial
@@ -95,70 +178,34 @@ core:
     DEFAULT_QUOTA_EDITORS: "1000"
     DEFAULT_QUOTA_VIEWERS: "1000"
   extraEnv:
-{% if _s3.customCACert != "" %}
-    - name: AWS_CA_BUNDLE
-      value: /etc/ssl/cacert/cacert.crt
-    - name: CURL_CA_BUNDLE
-      value: /etc/ssl/cacert/cacert.crt
-{% endif %}    - name: S3_ACCESS_KEY_ID
+{{ ca_env() }}    - name: S3_ACCESS_KEY_ID
       valueFrom:
         secretKeyRef: { name: goat-s3-credentials, key: access_key }
     - name: S3_SECRET_ACCESS_KEY
       valueFrom:
         secretKeyRef: { name: goat-s3-credentials, key: secret_key }
-{% if _s3.customCACert != "" %}
-  extraVolumes:
-    - name: cacert
-      configMap:
-        name: cacert
-        optional: true
-  extraVolumeMounts:
-    - name: cacert
-      mountPath: /etc/ssl/cacert
-      readOnly: true
-{% endif %}
-
+{{ ca_volumes() }}
 geoapi:
   enabled: true
   {{ img('geoapi') }}
   config:
     ENVIRONMENT: prod
-    DUCKLAKE_CREATE_IF_NOT_EXISTS: "true"
-    # geoapi fetches the realm public key from Keycloak at startup
-    # via requests. Needs REQUESTS_CA_BUNDLE and SSL_CERT_FILE on
-    # private-CA clusters (extraEnv below).
-    AUTH: "true"
-    KEYCLOAK_SERVER_URL: "{{ inv_access.platform.hostname }}"
-    REALM_NAME: "{{ inv_access.tenant.realm_name }}"
+    # Served under /geoapi (see the path map): OGC/STAC self/next links and
+    # the docs pages carry the prefix.
+    ROOT_PATH: "/geoapi"
     # POSTGRES_SERVER, DB and PORT are emitted by the chart's ConfigMap
     # from postgresql.external.*. Setting them here duplicates the
     # mapping key at render time. POSTGRES_USER and PASSWORD auto-wire
     # from goat-postgres-creds. POSTGRES_SERVER and PORT are overridden
     # via extraEnv (env beats envFrom) so `goat_addon.db.geoapi_host`
     # can point geoapi at a different endpoint than the rest of the stack.
-    DUCKLAKE_CATALOG_SCHEMA: "ducklake"
-    # Must match the DATA_PATH used by ducklake-init in ducklake.yml.
-    # Parquet lives in S3. The local path is only the ATTACH marker.
-    DUCKLAKE_DATA_DIR: "/app/data/ducklake"
     S3_PROVIDER: "{{ s3_provider }}"
     S3_ENDPOINT_URL: "{{ s3_internal_endpoint }}"
     S3_REGION: "{{ s3_region }}"
     S3_BUCKET_NAME: "{{ goat_addon.s3.bucket }}"
     S3_FORCE_PATH_STYLE: "true"
   extraEnv:
-{% if inv_k8s.ingress.ca_path is defined and inv_k8s.ingress.ca_path != "" %}
-    # Only useful with the cacert ConfigMap from namespace.yml.
-    # ACME-issued chains already validate against the OpenSSL default.
-    - name: REQUESTS_CA_BUNDLE
-      value: /etc/ssl/cacert/cacert.crt
-    - name: SSL_CERT_FILE
-      value: /etc/ssl/cacert/cacert.crt
-{% endif %}{% if _s3.customCACert != "" %}
-    - name: AWS_CA_BUNDLE
-      value: /etc/ssl/cacert/cacert.crt
-    - name: CURL_CA_BUNDLE
-      value: /etc/ssl/cacert/cacert.crt
-{% endif %}    - name: POSTGRES_SERVER
+{{ ca_env() }}    - name: POSTGRES_SERVER
       value: "{{ goat_addon.db.geoapi_host }}"
     - name: POSTGRES_PORT
       value: "{{ goat_addon.db.geoapi_port | string }}"
@@ -168,25 +215,7 @@ geoapi:
     - name: S3_SECRET_ACCESS_KEY
       valueFrom:
         secretKeyRef: { name: goat-s3-credentials, key: secret_key }
-  extraVolumes:
-{% if (inv_k8s.ingress.ca_path | default('')) != '' or _s3.customCACert != '' %}
-    - name: cacert
-      configMap:
-        name: cacert
-        optional: true
-{% endif %}    # Shared DuckLake data dir. worker-tools writes parquet, geoapi
-    # reads it. Single RWX PVC (goat-ducklake-data, from ducklake.yml).
-    - name: ducklake-data
-      persistentVolumeClaim:
-        claimName: goat-ducklake-data
-  extraVolumeMounts:
-{% if (inv_k8s.ingress.ca_path | default('')) != '' or _s3.customCACert != '' %}
-    - name: cacert
-      mountPath: /etc/ssl/cacert
-      readOnly: true
-{% endif %}    - name: ducklake-data
-      mountPath: /app/data
-  # Chart default is `enabled: false`. Without a readiness gate the pod
+{{ ca_volumes() }}  # Chart default is `enabled: false`. Without a readiness gate the pod
   # is published in the EndpointSlice the moment the container starts,
   # so a service that crashes before binding :8000 still receives
   # traffic and ingress-nginx returns a bare 502 (ECONNREFUSED) rather
@@ -201,47 +230,17 @@ geoapi:
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 3
-  # geoapi at /geoapi. Path shape and prefix stripping come from the
-  # ingress profile. Regex `rewrite-target` on nginx, `stripPrefix`
-  # Middleware on Traefik. geoapi emits absolute URLs from
-  # request.base_url (missing the prefix), but goat-web never consumes
-  # them. It composes every backend URL itself from NEXT_PUBLIC_GEOAPI_URL.
-  ingress:
-    enabled: true
-    className: "{{ inv_k8s.ingress_class }}"
-    annotations:
-{% if is_nginx %}      nginx.ingress.kubernetes.io/ssl-redirect: "{{ ssl_redirect }}"
-      nginx.ingress.kubernetes.io/whitelist-source-range: "{{ user_whitelist | default(['0.0.0.0/0']) | join(',') }}"
-{% endif %}{% if ingress_profile.needs_middleware %}      traefik.ingress.kubernetes.io/router.middlewares: "{{ goat_addon.namespace }}-goat-strip-geoapi@kubernetescrd"
-{% endif %}{% for k, v in ingress_profile.annotations.items() %}      {{ k }}: "{{ v }}"
-{% endfor %}    hosts:
-      - host: "{{ goat_ingress_host }}"
-        paths:
-          - path: "/geoapi{{ ingress_profile.path_suffix }}"
-            pathType: "{{ ingress_profile.pathType }}"
-    tls:
-      - secretName: "{{ goat_tls_secret }}"
-        hosts:
-          - "{{ goat_ingress_host }}"
+  {{ api_ingress('/geoapi') }}
 
 processes:
   enabled: true
   {{ img('processes') }}
   config:
     ENVIRONMENT: prod
-    AUTH: "true"
-    KEYCLOAK_SERVER_URL: "{{ inv_access.platform.hostname }}"
-    REALM_NAME: "{{ inv_access.tenant.realm_name }}"
+    ROOT_PATH: "/processes"
     # See geoapi note. Chart's ConfigMap emits POSTGRES_SERVER, DB and PORT.
-    DUCKLAKE_CATALOG_SCHEMA: "ducklake"
-    DUCKLAKE_DATA_DIR: "/app/data/ducklake"
     # processes declares both S3_* (boto3) and DUCKLAKE_S3_*
-<<<<<<< HEAD
-    # (goatlib DuckLake managers). DUCKLAKE_S3_* here stays in sync
-    # with the ducklake-init Job env in ducklake.yml.
-=======
     # (goatlib DuckLake managers).
->>>>>>> feat/collapse-s3-path-style-surface
     S3_PROVIDER: "{{ s3_provider }}"
     S3_ENDPOINT_URL: "{{ s3_internal_endpoint }}"
     S3_REGION: "{{ s3_region }}"
@@ -252,21 +251,10 @@ processes:
     # at its TLS-on default against plaintext MinIO.
     DUCKLAKE_S3_ENDPOINT: "{{ s3_internal_endpoint }}"
     DUCKLAKE_S3_BUCKET: "{{ goat_addon.s3.bucket }}"
-    WINDMILL_URL: "http://goat-windmill-server"
-    # Must match chart's windmill.bootstrap.workspace (default `goat`).
-    WINDMILL_WORKSPACE: "goat"
+    # WINDMILL_URL / WINDMILL_WORKSPACE / WINDMILL_TOKEN are wired by the
+    # chart (processes.windmillAutoWire), including the bootstrap token.
   extraEnv:
-{% if inv_k8s.ingress.ca_path is defined and inv_k8s.ingress.ca_path != "" %}
-    - name: REQUESTS_CA_BUNDLE
-      value: /etc/ssl/cacert/cacert.crt
-    - name: SSL_CERT_FILE
-      value: /etc/ssl/cacert/cacert.crt
-{% endif %}{% if _s3.customCACert != "" %}
-    - name: AWS_CA_BUNDLE
-      value: /etc/ssl/cacert/cacert.crt
-    - name: CURL_CA_BUNDLE
-      value: /etc/ssl/cacert/cacert.crt
-{% endif %}    - name: S3_ACCESS_KEY_ID
+{{ ca_env() }}    - name: S3_ACCESS_KEY_ID
       valueFrom:
         secretKeyRef: { name: goat-s3-credentials, key: access_key }
     - name: S3_SECRET_ACCESS_KEY
@@ -278,24 +266,7 @@ processes:
     - name: DUCKLAKE_S3_SECRET_KEY
       valueFrom:
         secretKeyRef: { name: goat-s3-credentials, key: secret_key }
-  extraVolumes:
-{% if (inv_k8s.ingress.ca_path | default('')) != '' or _s3.customCACert != '' %}
-    - name: cacert
-      configMap:
-        name: cacert
-        optional: true
-{% endif %}  extraVolumeMounts:
-{% if (inv_k8s.ingress.ca_path | default('')) != '' or _s3.customCACert != '' %}
-    - name: cacert
-      mountPath: /etc/ssl/cacert
-      readOnly: true
-{% endif %}  # Chart default is `enabled: false`. Without a readiness gate the pod
-  # is published in the EndpointSlice the moment the container starts,
-  # so a service that crashes before binding :8000 still receives
-  # traffic and ingress-nginx returns a bare 502 (ECONNREFUSED) rather
-  # than a 503 that names an unready backend. tcpSocket (not httpGet)
-  # asserts only "bound to the port", which is the exact failure mode,
-  # and needs no health-endpoint path.
+{{ ca_volumes() }}  # See geoapi.readinessProbe.
   readinessProbe:
     enabled: true
     tcpSocket:
@@ -304,64 +275,51 @@ processes:
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 3
-  # processes at /processes. Same profile-driven prefix-strip pattern as
-  # geoapi. Same absolute-URL caveat. The UI composes URLs itself from
-  # NEXT_PUBLIC_PROCESSES_URL.
-  ingress:
-    enabled: true
-    className: "{{ inv_k8s.ingress_class }}"
-    annotations:
-{% if is_nginx %}      nginx.ingress.kubernetes.io/ssl-redirect: "{{ ssl_redirect }}"
-      nginx.ingress.kubernetes.io/whitelist-source-range: "{{ user_whitelist | default(['0.0.0.0/0']) | join(',') }}"
-{% endif %}{% if ingress_profile.needs_middleware %}      traefik.ingress.kubernetes.io/router.middlewares: "{{ goat_addon.namespace }}-goat-strip-processes@kubernetescrd"
-{% endif %}{% for k, v in ingress_profile.annotations.items() %}      {{ k }}: "{{ v }}"
-{% endfor %}    hosts:
-      - host: "{{ goat_ingress_host }}"
-        paths:
-          - path: "/processes{{ ingress_profile.path_suffix }}"
-            pathType: "{{ ingress_profile.pathType }}"
-    tls:
-      - secretName: "{{ goat_tls_secret }}"
-        hosts:
-          - "{{ goat_ingress_host }}"
+  {{ api_ingress('/processes') }}
+
+# STAC API + MCP server for the GOAT data catalog. Database-less: serves the
+# catalog mirror from the shared data volume. Offline, `sync_catalog` cannot
+# reach plan4better's catalog bucket, so the catalog stays empty (it answers
+# an empty STAC root) until a mirror is provided.
+catalog:
+  enabled: true
+  {{ img('catalog') }}
+  config:
+    ROOT_PATH: "/catalog"
+{% if has_ingress_ca %}  extraEnv:
+{{ ca_env() }}{% endif %}{{ ca_volumes() }}  {{ api_ingress('/catalog') }}
 
 web:
   enabled: true
   {{ img('web') }}
   auth:
-    enabled: true
-    existingSecret: goat-keycloak-creds
     publicUrl: "{{ goat_public_url }}"
+  # Browser-facing URLs, substituted into the client bundle at pod start.
+  #
+  # TRAILING-SLASH ASYMMETRY (load-bearing, do not "normalise").
+  #
+  # `api` is consumed as `new URL("api/v2/...", base)` (organizations.ts
+  # and ~20 sites). RFC 3986 drops everything after the last `/` in base.
+  # Without the trailing slash, `.../core` resolves to `.../api/v2/...` and
+  # lands on goat-web with an HTML 404. MUST end in `/`.
+  #
+  # The others are string-concatenated with an explicit leading slash and
+  # MUST NOT end in `/`. `catalog` is the STAC root; set it explicitly, the
+  # chart would derive `<host>/stac` without the /catalog prefix.
+  publicUrls:
+    api: "{{ goat_public_url }}/core/"
+    geoapi: "{{ goat_public_url }}/geoapi"
+    processes: "{{ goat_public_url }}/processes"
+    catalog: "{{ goat_public_url }}/catalog/stac"
   extraEnv:
-{% if inv_k8s.ingress.ca_path is defined and inv_k8s.ingress.ca_path != "" %}
-    # NextAuth (server-side) calls Keycloak over HTTPS. Node needs
+    # NEXT_PUBLIC_APP_URL feeds NEXTAUTH_URL, which rejects a trailing `/`
+    # (produces `//` in callbacks and 404s). MUST NOT end in `/`.
+    - name: NEXT_PUBLIC_APP_URL
+      value: "{{ goat_public_url }}"
+{% if has_ingress_ca %}    # NextAuth (server-side) calls Keycloak over HTTPS. Node needs
     # the CA bundle on private-CA clusters.
     - name: NODE_EXTRA_CA_CERTS
       value: /etc/ssl/cacert/cacert.crt
-{% endif %}    # entrypoint.sh substitutes APP_NEXT_PUBLIC_* placeholders in
-    # the bundle at pod start. All four URLs are the PUBLIC url.
-    #
-    # TRAILING-SLASH ASYMMETRY (load-bearing, do not "normalise").
-    #
-    # NEXT_PUBLIC_API_URL is consumed as `new URL("api/v2/...", base)`
-    # (organizations.ts and ~20 sites). RFC 3986 drops everything
-    # after the last `/` in base. Without the trailing slash,
-    # `.../core` resolves to `.../api/v2/...` and lands on goat-web
-    # with an HTML 404. MUST end in `/`.
-    #
-    # The other three are string-concatenated with an explicit
-    # leading slash. NEXT_PUBLIC_APP_URL additionally feeds
-    # NEXTAUTH_URL, which rejects a trailing `/` (produces `//` in
-    # callbacks and 404s). MUST NOT end in `/`.
-    - name: NEXT_PUBLIC_API_URL
-      value: "{{ goat_public_url }}/core/"
-    - name: NEXT_PUBLIC_APP_URL
-      value: "{{ goat_public_url }}"
-    - name: NEXT_PUBLIC_GEOAPI_URL
-      value: "{{ goat_public_url }}/geoapi"
-    - name: NEXT_PUBLIC_PROCESSES_URL
-      value: "{{ goat_public_url }}/processes"
-{% if inv_k8s.ingress.ca_path is defined and inv_k8s.ingress.ca_path != "" %}
   extraVolumes:
     - name: cacert
       configMap:
@@ -386,6 +344,7 @@ web:
       # the browser replays as `invalid_grant (Code not valid)`.
       nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
       nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
+{% else %}      {}
 {% endif %}    hosts:
       - host: "{{ goat_ingress_host }}"
         paths:
@@ -441,6 +400,10 @@ windmill:
       existingSecretPasswordKey: password
   scriptSync:
     enabled: true
+    image:
+      registry: "{{ software.addon_goat.images.windmill_worker_tools.registry }}"
+      repository: "{{ software.addon_goat.images.windmill_worker_tools.repository }}"
+      tag: "{{ software.addon_goat.images.windmill_worker_tools.tag }}"
   server:
     enabled: true
     image:
@@ -458,9 +421,9 @@ windmill:
     ingress:
       enabled: false
   # Each goatlib-running worker needs the app DB, S3 and DuckLake
-  # config. Chart v0.3.7 renamed its internal vars to _WMILL_DB_*,
-  # freeing POSTGRES_* for the goat DB. WHITELIST_ENVS exposes them
-  # to user scripts at runtime.
+  # config (the chart does not wire the workers). The chart's `data`
+  # volume is mounted on tools and workflows at /app/data.
+  # WHITELIST_ENVS exposes the variables to user scripts at runtime.
   workers:
     default:
       enabled: true
@@ -472,9 +435,10 @@ windmill:
       config:
         DATABASE_CONNECTIONS: "3"
         NUM_WORKERS: "1"
+{% for worker in ['tools', 'workflows'] %}
     # `tools` and `workflows` share windmill-worker-tools (heavier,
     # bundles goatlib and geospatial deps).
-    tools:
+    {{ worker }}:
       enabled: true
       image:
         registry: "{{ software.addon_goat.images.windmill_worker_tools.registry }}"
@@ -486,20 +450,13 @@ windmill:
       # merges chart keys into empty user maps, so `{}` re-inherits.
       nodeSelector: null
       tolerations: []
-      # Shared DuckLake PVC. Writes here are visible to geoapi.
-      persistence:
-        enabled: true
-        existingClaim: goat-ducklake-data
       config:
         MODE: "worker"
-        WORKER_GROUP: "tools"
-        WORKER_TAGS: "tools"
+        WORKER_GROUP: "{{ worker }}"
+        WORKER_TAGS: "{{ worker }}"
         DATABASE_CONNECTIONS: "3"
         NUM_WORKERS: "1"
-        # DUCKDB_EXTENSION_DIRECTORY is whitelisted so job subprocesses
-        # find the extensions baked at /opt/duckdb-extensions instead
-        # of downloading (blocked on egress-restricted clusters).
-        WHITELIST_ENVS: "POSTGRES_SERVER,POSTGRES_PORT,POSTGRES_DB,POSTGRES_USER,POSTGRES_PASSWORD,S3_PROVIDER,S3_FORCE_PATH_STYLE,S3_ENDPOINT_URL,S3_PUBLIC_ENDPOINT_URL,S3_REGION,S3_BUCKET_NAME,S3_ACCESS_KEY_ID,S3_SECRET_ACCESS_KEY,MAX_UPLOAD_DATASET_FILE_SIZE,DUCKLAKE_CATALOG_SCHEMA,DUCKLAKE_DATA_DIR,CUSTOMER_SCHEMA,DUCKDB_EXTENSION_DIRECTORY,AWS_CA_BUNDLE,CURL_CA_BUNDLE"
+        WHITELIST_ENVS: "{{ worker_whitelist_envs }}"
         POSTGRES_SERVER: "{{ goat_addon.db.host }}"
         POSTGRES_PORT: "{{ goat_addon.db.port }}"
         POSTGRES_DB: "{{ goat_addon.db.goat_db_name }}"
@@ -512,6 +469,7 @@ windmill:
         MAX_UPLOAD_DATASET_FILE_SIZE: "1073741824"
         DUCKLAKE_CATALOG_SCHEMA: "ducklake"
         DUCKLAKE_DATA_DIR: "/app/data/ducklake"
+        DATA_DIR: "/app/data"
         CUSTOMER_SCHEMA: "customer"
       extraEnv:
         - name: POSTGRES_USER
@@ -526,8 +484,7 @@ windmill:
         - name: S3_SECRET_ACCESS_KEY
           valueFrom:
             secretKeyRef: { name: goat-s3-credentials, key: secret_key }
-{% if _s3.customCACert != "" %}
-        - name: AWS_CA_BUNDLE
+{% if has_s3_ca %}        - name: AWS_CA_BUNDLE
           value: /etc/ssl/cacert/cacert.crt
         - name: CURL_CA_BUNDLE
           value: /etc/ssl/cacert/cacert.crt
@@ -541,67 +498,7 @@ windmill:
           mountPath: /etc/ssl/cacert
           readOnly: true
 {% endif %}
-    workflows:
-      enabled: true
-      image:
-        registry: "{{ software.addon_goat.images.windmill_worker_tools.registry }}"
-        repository: "{{ software.addon_goat.images.windmill_worker_tools.repository }}"
-        tag: "{{ software.addon_goat.images.windmill_worker_tools.tag }}"
-        pullPolicy: "{{ software.addon_goat.images.windmill_worker_tools.pullPolicy | default('Always') }}"
-      # See tools.nodeSelector. `null` is required to drop chart default.
-      nodeSelector: null
-      tolerations: []
-      persistence:
-        enabled: true
-        existingClaim: goat-ducklake-data
-      config:
-        MODE: "worker"
-        WORKER_GROUP: "workflows"
-        WORKER_TAGS: "workflows"
-        DATABASE_CONNECTIONS: "3"
-        NUM_WORKERS: "1"
-        WHITELIST_ENVS: "POSTGRES_SERVER,POSTGRES_PORT,POSTGRES_DB,POSTGRES_USER,POSTGRES_PASSWORD,S3_PROVIDER,S3_FORCE_PATH_STYLE,S3_ENDPOINT_URL,S3_PUBLIC_ENDPOINT_URL,S3_REGION,S3_BUCKET_NAME,S3_ACCESS_KEY_ID,S3_SECRET_ACCESS_KEY,MAX_UPLOAD_DATASET_FILE_SIZE,DUCKLAKE_CATALOG_SCHEMA,DUCKLAKE_DATA_DIR,CUSTOMER_SCHEMA,DUCKDB_EXTENSION_DIRECTORY,AWS_CA_BUNDLE,CURL_CA_BUNDLE"
-        POSTGRES_SERVER: "{{ goat_addon.db.host }}"
-        POSTGRES_PORT: "{{ goat_addon.db.port }}"
-        POSTGRES_DB: "{{ goat_addon.db.goat_db_name }}"
-        S3_PROVIDER: "{{ s3_provider }}"
-        S3_ENDPOINT_URL: "{{ s3_internal_endpoint }}"
-        S3_PUBLIC_ENDPOINT_URL: "{{ s3_public_endpoint }}"
-        S3_REGION: "{{ s3_region }}"
-        S3_BUCKET_NAME: "{{ goat_addon.s3.bucket }}"
-        S3_FORCE_PATH_STYLE: "true"
-        MAX_UPLOAD_DATASET_FILE_SIZE: "1073741824"
-        DUCKLAKE_CATALOG_SCHEMA: "ducklake"
-        DUCKLAKE_DATA_DIR: "/app/data/ducklake"
-        CUSTOMER_SCHEMA: "customer"
-      extraEnv:
-        - name: POSTGRES_USER
-          valueFrom:
-            secretKeyRef: { name: goat-postgres-creds, key: username }
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef: { name: goat-postgres-creds, key: password }
-        - name: S3_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef: { name: goat-s3-credentials, key: access_key }
-        - name: S3_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef: { name: goat-s3-credentials, key: secret_key }
-{% if _s3.customCACert != "" %}
-        - name: AWS_CA_BUNDLE
-          value: /etc/ssl/cacert/cacert.crt
-        - name: CURL_CA_BUNDLE
-          value: /etc/ssl/cacert/cacert.crt
-      extraVolumes:
-        - name: cacert
-          configMap:
-            name: cacert
-            optional: true
-      extraVolumeMounts:
-        - name: cacert
-          mountPath: /etc/ssl/cacert
-          readOnly: true
-{% endif %}
+{% endfor %}
     print:
       enabled: true
       image:
