@@ -1,6 +1,6 @@
 # Rendered in-memory by tasks/templates/k8s-helm.yml (via helm_install.yml)
 # and passed to `helm install` as a values file. Written for GOAT chart
-# 0.7.x / GOAT >= v3.0.3.
+# 0.7.x / GOAT >= v3.0.9.
 #
 # Path map (all rooted on the ingress-host). No controller rewrites anything:
 # every service knows its own prefix and serves under it.

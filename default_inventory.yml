@@ -5,8 +5,7 @@ inv_addons:
   goat:
     enable: true
     # One pin for every plan4better/goat image.
-    # TODO(GOAT v3.0.9): move to "v3.0.9" once it is released.
-    release: "v3.0.3"
+    release: "v3.0.9"
     web:
       subdomain: "goat"
       # public_url: "https://goat.{{ DOMAIN }}"
@@ -28,7 +27,7 @@ inv_addons:
     # chart:                        # OCI pull from ghcr.io by default. Override
     #                               # ref to a local tgz for offline installs.
     #   ref: "oci://ghcr.io/plan4better/charts/goat"
-    #   version: "0.5.1"            # TODO(chart 0.7.0): "0.7.0" once released
+    #   version: "0.7.0"
     # db:
     #   goat_db_name: "goat"
     #   windmill_db_name: "windmill"

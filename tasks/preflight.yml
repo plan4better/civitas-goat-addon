@@ -26,8 +26,8 @@
       This addon version needs GOAT chart 0.7.0 or later, but the run would
       install chart {{ goat_chart_version }} from {{ goat_addon.chart.ref }}.
       Set inv_addons.goat.chart.version (or chart.ref to a local 0.7.x
-      archive). The default pin in vars/software_references.yml stays at
-      0.5.1 until chart 0.7.0 is released.
+      archive), or leave both unset for the pin in
+      vars/software_references.yml.
     quiet: true
 
 - name: GOAT addon preflight connection pooler host

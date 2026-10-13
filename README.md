@@ -4,9 +4,7 @@
 
 ## Status
 
-Installs the GOAT Helm chart (`oci://ghcr.io/plan4better/charts/goat` v0.7.x, GOAT v3.0.3+; values and version history in the [chart README](https://github.com/plan4better/goat/blob/main/deploy/helm/goat/README.md)) into civitas with:
-
-> **TODO (release):** `templates/goat_values.yml` is written for chart 0.7.0, which is not released yet. `vars/software_references.yml` still pins chart 0.5.1 and GOAT v3.0.3 (marked `TODO`); move both pins (chart `0.7.0`, GOAT `v3.0.9`) once they are released. The values do not install with chart 0.5.1, so until then a run with the default pin stops at the first task (`tasks/preflight.yml`), which refuses any chart older than 0.7.0; set `chart.version` (or `chart.ref` to a local 0.7.x archive) to run it.
+Installs the GOAT Helm chart (`oci://ghcr.io/plan4better/charts/goat` v0.7.x, GOAT v3.0.9+; values and version history in the [chart README](https://github.com/plan4better/goat/blob/main/deploy/helm/goat/README.md)) into civitas with:
 
 - `<env>-goat-stack` namespace + civitas CA mirroring
 - `goat` + `windmill` databases provisioned in civitas's central-db (Zalando `preparedDatabases` patch)
@@ -49,7 +47,7 @@ Every image built from the `plan4better/goat` monorepo pins to a single release 
 ```yaml
 inv_addons:
   goat:
-    release: "v3.0.3"    # applies to core / web / geoapi / processes / catalog /
+    release: "v3.0.9"    # applies to core / web / geoapi / processes / catalog /
                          # windmill-server / windmill-worker-{default,tools,print}
 ```
 
@@ -68,11 +66,11 @@ inv_addons:
   goat:
     enable: true
     namespace: "{{ ENVIRONMENT }}-goat-stack"
-    release: "v3.0.3"
+    release: "v3.0.9"
     chart:
       # OCI refs are installed with --version; a local .tgz path pins itself.
       ref: "oci://ghcr.io/plan4better/charts/goat"
-      version: "0.5.1"   # TODO(chart 0.7.0): "0.7.0" once released
+      version: "0.7.0"
     db:
       # Optional — Postgres database names. Defaults shown.
       # Override only if you need to co-tenant multiple goat installs in
@@ -334,7 +332,7 @@ Notes and caveats:
 
 Invite first. A user who logs in without a pending invitation is prompted to create an own organization, which cannot be undone without deleting the user (see open mode above).
 
-**Offboarding runbook.** Removing a user from the gate group does not end their GOAT sessions: the gate runs at authentication time only, and a signed-in browser keeps refreshing its tokens without passing it again. Remove the user from the group, then end their sessions in Keycloak (Users, the user, Sessions, Sign out). Access tokens already issued stay valid until they expire (the realm's access token lifespan). GOAT does not yet check which client a token was issued for (its `azp` claim), so its APIs also accept access tokens the user obtains through any other client of the realm. To cut a user off completely until GOAT checks it (see the TODO under Authentication), disable the user in Keycloak, which ends their access to every client of the realm.
+**Offboarding runbook.** Removing a user from the gate group does not end their GOAT sessions: the gate runs at authentication time only, and a signed-in browser keeps refreshing its tokens without passing it again. Remove the user from the group, then end their sessions in Keycloak (Users, the user, Sessions, Sign out). Access tokens already issued stay valid until they expire (the realm's access token lifespan). GOAT's APIs accept only tokens issued to `keycloak.allowed_clients`, so a token the user obtains through another client of the realm does not work on them. To cut a user off from every client of the realm at once, disable the user in Keycloak.
 
 ### Organizations and API tokens
 
@@ -354,9 +352,7 @@ Both settings need GOAT v3.0.9 or later.
 
 Check after an install: `kubectl -n <ns> exec deploy/goat-core -- printenv AUTH` prints `true`, and an API call without a token (e.g. `curl -i https://<host>/core/api/v2/users/profile`) answers `401`.
 
-GOAT accepts any valid access token of the realm: it checks signature, issuer and expiry, not the client the token was issued for. Removing someone's access therefore happens in Keycloak, with or without the login gate: end their sessions and, to block them at once, disable the user (see the offboarding runbook above).
-
-> **TODO (next GOAT release):** GOAT's next release adds `AUTH_ALLOWED_CLIENTS`, set by the chart from `global.auth.allowedClients`: a token is then accepted only if it was issued to one of those clients (its `azp` claim), e.g. `[goat-web]`. Not released yet and not wired here; once it is, the addon can set it to `keycloak.client_id`, and with the login gate on, tokens of other realm clients stop working on GOAT's APIs.
+GOAT accepts a token only if it is valid for the realm and was issued to one of `keycloak.allowed_clients` (see above). Removing someone's access still happens in Keycloak, with or without the login gate: end their sessions and, to block them at once, disable the user (see the offboarding runbook above).
 
 ## Routing base data (street network, public transport)
 
@@ -385,7 +381,7 @@ Without `bbox` the task fetches the full data set (tens of GB). Other arguments:
 
 ```sh
 docker run --rm --entrypoint /venv/bin/python -v "$PWD:/out" \
-  ghcr.io/plan4better/goat/windmill-worker-tools:v3.0.3 \
+  ghcr.io/plan4better/goat/windmill-worker-tools:v3.0.9 \
   -m goatlib.tasks.sync_base_data mirror --to /out/goat-base-data --bbox=<min_lon>,<min_lat>,<max_lon>,<max_lat>
 # upload ./goat-base-data to the bucket, e.g. under goat/goat-base-data/, then set
 #   base_data.source_url: "s3://goat/goat-base-data/"   (GOAT v3.0.5+)
@@ -534,7 +530,7 @@ ansible-playbook -i cc_cli_inventory.yml core_platform/playbook.yml \
 
 | addon | civitas-core | GOAT chart | GOAT release |
 |---|---|---|---|
-| **current** | v1.7.x+ | v0.7.0 (TODO: not released yet, pin still 0.5.1) | v3.0.3+, v3.0.9 once released (TODO) |
+| **current** | v1.7.x+ | v0.7.0 | v3.0.9 |
 | v0.3.0      | v1.7.x+ | v0.4.x | v2.4.60 |
 | v0.2.0      | v1.5.x+ | v0.3.x | mixed (`latest` / `f59d1e3` / `v2.4.36`) |
 | v0.1.x      | v1.5.x+ | v0.1.x |  |
