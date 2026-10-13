@@ -99,11 +99,11 @@
         pathType: Prefix
         backend:
           service:
-            name: "{{ 'minio' if goat_addon.s3.mode == 'provision' else 'goat-s3-upstream' }}"
-            # Named `api` port. Both Services expose it and resolve
-            # in either mode without stringifying the int.
+            name: "{{ 'goat-garage' if goat_addon.s3.mode == 'provision' else 'goat-s3-upstream' }}"
+            # Named port, so the int is never stringified: the chart's
+            # Garage Service calls its S3 API `s3`, goat-s3-upstream `api`.
             port:
-              name: api
+              name: "{{ 's3' if goat_addon.s3.mode == 'provision' else 'api' }}"
 
 - name: GOAT addon deploy S3 public ingress for browser uploads
   kubernetes.core.k8s:
@@ -133,3 +133,58 @@
           - host: "{{ goat_ingress_host }}"
             http:
               paths: "{{ goat_s3_ingress_paths }}"
+
+# Uploaded images at /<assets bucket>/<key> (ingress-nginx only: on another
+# controller, route it yourself, README "Uploaded images").
+# - Provision mode: public reads from Garage's website endpoint, which picks
+#   the bucket from the Host header. The path loses its prefix and gets the
+#   bucket's website host, as in the compose bundle.
+# - Attach mode: core serves the images (ASSETS_SERVED_BY_CORE) at
+#   /core/api/v2/asset/file/<key>. Links saved in provision mode keep
+#   working once the assets bucket is copied under assets/ (README
+#   "Switching from provision to attach").
+# Replaced rather than patched, so no annotation of the other mode is left.
+- name: GOAT addon deploy the public Ingress for uploaded images
+  when: inv_k8s.ingress_class == 'nginx'
+  vars:
+    goat_assets_provision: "{{ goat_addon.s3.mode == 'provision' }}"
+    goat_assets_annotations:
+      nginx.ingress.kubernetes.io/ssl-redirect: "{{ 'false' if (inv_k8s.ingress.http | default(false)) else 'true' }}"
+      nginx.ingress.kubernetes.io/whitelist-source-range: "{{ user_whitelist | default(['0.0.0.0/0']) | join(',') }}"
+      nginx.ingress.kubernetes.io/use-regex: "true"
+      nginx.ingress.kubernetes.io/rewrite-target: "{{ '/$2' if goat_assets_provision | bool else '/core/api/v2/asset/file/$2' }}"
+    goat_assets_vhost:
+      nginx.ingress.kubernetes.io/upstream-vhost: "{{ goat_s3_assets_bucket }}.web.garage.internal"
+  kubernetes.core.k8s:
+    state: present
+    force: true
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: goat-s3-assets
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+          app.kubernetes.io/name: goat
+          app.kubernetes.io/part-of: goat
+        annotations: "{{ goat_assets_annotations | combine(goat_assets_vhost if goat_assets_provision | bool else {}) }}"
+      spec:
+        ingressClassName: "{{ inv_k8s.ingress_class }}"
+        tls:
+          - hosts:
+              - "{{ goat_ingress_host }}"
+            secretName: "{{ goat_tls_secret }}"
+        rules:
+          - host: "{{ goat_ingress_host }}"
+            http:
+              paths:
+                - path: "/{{ goat_s3_assets_bucket }}(/|$)(.*)"
+                  pathType: ImplementationSpecific
+                  backend:
+                    service:
+                      name: "{{ 'goat-garage' if goat_assets_provision | bool else 'goat-core' }}"
+                      port:
+                        name: "{{ 'web' if goat_assets_provision | bool else 'http' }}"

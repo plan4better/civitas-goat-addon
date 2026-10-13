@@ -1,6 +1,6 @@
 # Rendered in-memory by tasks/templates/k8s-helm.yml (via helm_install.yml)
 # and passed to `helm install` as a values file. Written for GOAT chart
-# 0.5.x / GOAT >= v3.0.3.
+# 0.7.x / GOAT >= v3.0.3.
 #
 # Path map (all rooted on the ingress-host). No controller rewrites anything:
 # every service knows its own prefix and serves under it.
@@ -8,10 +8,12 @@
 #   /core        goat-core       API_V2_STR carries the prefix
 #   /geoapi      geoapi          ROOT_PATH=/geoapi
 #   /processes   processes       ROOT_PATH=/processes
-#   /catalog     catalog         ROOT_PATH=/catalog (STAC API at /catalog/stac)
+#   /catalog-api catalog         ROOT_PATH=/catalog-api (STAC API at /catalog-api/stac);
+#                                not /catalog, which is goat-web's own catalog page
 #   /<bucket>    S3 gateway (s3_gateway.yml). MUST equal the bucket
 #                name for path-style SigV4, no rewrite.
-#   windmill has no public ingress. processes reaches it in-cluster only.
+#   windmill has no public ingress unless windmill.ingress.enable (own host,
+#   see windmill.server). processes reaches it in-cluster either way.
 {#- Derived values (hostname, TLS, S3 endpoints) come from vars/default.yml.
     s3_public_endpoint is always goat_public_url in both modes. The addon
     fronts external S3 with a `/<bucket>` Ingress in the goat namespace so
@@ -30,22 +32,10 @@
 {%- set has_ingress_ca = (inv_k8s.ingress.ca_path | default('')) != '' %}
 {%- set has_s3_ca = _s3.customCACert != '' %}
 {%- set has_cacert = has_ingress_ca or has_s3_ca %}
-{#- Windmill hands job subprocesses only the env vars listed here. This is the
-    chart 0.5.x default (keep it in sync when the chart changes it) plus what
-    this addon adds: CUSTOMER_SCHEMA, the baked DuckDB extension dir and the
-    CA bundles. #}
-{%- set worker_whitelist_envs = [
-      'MAX_UPLOAD_DATASET_FILE_SIZE', 'POSTGRES_SERVER', 'POSTGRES_PORT', 'POSTGRES_USER',
-      'POSTGRES_PASSWORD', 'POSTGRES_DB', 'POSTGRES_DATABASE_URI', 'DUCKLAKE_DATA_DIR',
-      'DUCKLAKE_CATALOG_SCHEMA', 'TILES_DATA_DIR', 'DATA_DIR', 'S3_PROVIDER',
-      'S3_FORCE_PATH_STYLE', 'S3_ENDPOINT_URL', 'S3_PUBLIC_ENDPOINT_URL', 'S3_ACCESS_KEY_ID',
-      'S3_SECRET_ACCESS_KEY', 'S3_BUCKET_NAME', 'S3_REGION', 'CATALOG_S3_BUCKET',
-      'CATALOG_S3_ENDPOINT_URL', 'CATALOG_S3_ACCESS_KEY_ID', 'CATALOG_S3_SECRET_ACCESS_KEY',
-      'CATALOG_S3_REGION', 'OD_MATRIX_BASE_PATH', 'STREET_NETWORK_EDGES_BASE_PATH',
-      'STREET_NETWORK_NODES_BASE_PATH', 'PT_NETWORK_BASE_PATH', 'GTFS_DATA_PATH',
-      'GEOCODING_URL', 'GEOCODING_AUTHORIZATION',
-      'CUSTOMER_SCHEMA', 'DUCKDB_EXTENSION_DIRECTORY', 'AWS_CA_BUNDLE', 'CURL_CA_BUNDLE',
-    ] | join(',') %}
+{#- The chart's global.caBundle mounts the same ConfigMap at this path in core,
+    web and the print, tools and workflows workers. The workers render no
+    extraVolumes, so their CA env points here. #}
+{%- set chart_ca_path = '/etc/goat/ca/ca.pem' %}
 
 global:
   # inv_k8s.storage_class is a dict ({loc, rwo, rwx}). The chart wants
@@ -55,6 +45,23 @@ global:
   commonLabels:
     civitas.core/owner: goat-addon
     civitas.core/env: "{{ ENVIRONMENT }}"
+{% if goat_addon.s3.mode == 'provision' %}
+  # Provision mode: the chart's Garage (`garage` below) is the store. These
+  # name its bucket, the key pair it imports (goat-s3-credentials) and the
+  # public URLs on the GOAT host, where s3_gateway.yml routes /<bucket> and
+  # /goat-assets to it. The services' S3_* come from their `config`; core's
+  # bucket for uploaded images (assets) comes from here.
+  s3:
+    bucket: "{{ goat_addon.s3.bucket }}"
+    existingSecret: goat-s3-credentials
+    existingSecretKeys:
+      accessKeyId: access_key
+      secretAccessKey: secret_key
+    publicEndpointUrl: "{{ goat_public_url }}"
+    assets:
+      bucket: "{{ goat_s3_assets_bucket }}"
+      publicUrl: "{{ goat_public_url }}/{{ goat_s3_assets_bucket }}"
+{% endif %}
   # One auth switch for core, web, geoapi, processes and catalog. Every
   # service validates tokens against the civitas realm; the Keycloak client
   # and this Secret (server-url, realm, client-id, client-secret,
@@ -64,7 +71,17 @@ global:
   auth:
     enabled: true
     existingSecret: goat-keycloak-creds
-
+    # Tokens of these clients only (keycloak.allowed_clients), and who may
+    # set up an organization (keycloak.organization_creation).
+    allowedClients: {{ goat_addon.keycloak.allowed_clients | to_json }}
+    allowOrganizationCreation: {{ goat_addon.keycloak.organization_creation | bool | lower }}
+{% if has_cacert %}  # The `cacert` ConfigMap (namespace.yml), mounted by the chart at
+  # /etc/goat/ca/ca.pem in core, web (NODE_EXTRA_CA_CERTS) and the print,
+  # tools and workflows workers (GOAT_CA_BUNDLE).
+  caBundle:
+    existingConfigMap: cacert
+    key: cacert.crt
+{% endif %}
 # One shared volume at /app/data for geoapi, processes, catalog, core and the
 # tools/workflows workers: DuckLake parquet (every user layer lives HERE, not
 # in S3), the catalog mirror, geoip and the routing base data. The claim is
@@ -166,7 +183,11 @@ core:
     S3_REGION: "{{ s3_region }}"
     S3_BUCKET_NAME: "{{ goat_addon.s3.bucket }}"
     S3_FORCE_PATH_STYLE: "true"
-    # No cloud metadata service here: stop boto3 probing 169.254.169.254.
+{% if goat_addon.s3.mode == 'attach' %}    # The attached store has no publicly readable bucket for uploaded images:
+    # core keeps them in the bucket above under assets/ and serves them at
+    # /core/api/v2/asset/file/<key>, a redirect to a signed URL on /<bucket>.
+    ASSETS_SERVED_BY_CORE: "true"
+{% endif %}    # No cloud metadata service here: stop boto3 probing 169.254.169.254.
     AWS_EC2_METADATA_DISABLED: "true"
     # Default plan + quotas feed SELF_HOSTED_PLAN_METADATA in
     # crud_organization.py. STRIPE_SECRET_KEY MUST stay unset —
@@ -193,23 +214,22 @@ geoapi:
     # Served under /geoapi (see the path map): OGC/STAC self/next links and
     # the docs pages carry the prefix.
     ROOT_PATH: "/geoapi"
-    # POSTGRES_SERVER, DB and PORT are emitted by the chart's ConfigMap
-    # from postgresql.external.*. Setting them here duplicates the
-    # mapping key at render time. POSTGRES_USER and PASSWORD auto-wire
-    # from goat-postgres-creds. POSTGRES_SERVER and PORT are overridden
-    # via extraEnv (env beats envFrom) so `goat_addon.db.geoapi_host`
-    # can point geoapi at a different endpoint than the rest of the stack.
+    # POSTGRES_SERVER, DB and PORT come from the chart's ConfigMap
+    # (postgresql.external.*), POSTGRES_USER and PASSWORD from
+    # goat-postgres-creds. With db.geoapi_host or db.geoapi_port in the
+    # inventory, extraEnv overrides SERVER and PORT (env beats envFrom), so
+    # geoapi can use another endpoint than the rest of the stack.
     S3_PROVIDER: "{{ s3_provider }}"
     S3_ENDPOINT_URL: "{{ s3_internal_endpoint }}"
     S3_REGION: "{{ s3_region }}"
     S3_BUCKET_NAME: "{{ goat_addon.s3.bucket }}"
     S3_FORCE_PATH_STYLE: "true"
   extraEnv:
-{{ ca_env() }}    - name: POSTGRES_SERVER
+{{ ca_env() }}{% if goat_addon.db.geoapi_override | bool %}    - name: POSTGRES_SERVER
       value: "{{ goat_addon.db.geoapi_host }}"
     - name: POSTGRES_PORT
       value: "{{ goat_addon.db.geoapi_port | string }}"
-    - name: S3_ACCESS_KEY_ID
+{% endif %}    - name: S3_ACCESS_KEY_ID
       valueFrom:
         secretKeyRef: { name: goat-s3-credentials, key: access_key }
     - name: S3_SECRET_ACCESS_KEY
@@ -248,7 +268,7 @@ processes:
     S3_FORCE_PATH_STYLE: "true"
     # Full URL: goatlib's duckdb_s3_endpoint() strips the scheme and
     # uses it to derive s3_use_ssl. A scheme-less value leaves DuckDB
-    # at its TLS-on default against plaintext MinIO.
+    # at its TLS-on default against a plaintext in-cluster store.
     DUCKLAKE_S3_ENDPOINT: "{{ s3_internal_endpoint }}"
     DUCKLAKE_S3_BUCKET: "{{ goat_addon.s3.bucket }}"
     # WINDMILL_URL / WINDMILL_WORKSPACE / WINDMILL_TOKEN are wired by the
@@ -277,6 +297,21 @@ processes:
     failureThreshold: 3
   {{ api_ingress('/processes') }}
 
+{% if goat_addon.s3.mode == 'provision' %}
+# Provision mode: the chart's single-node Garage (not HA) holds uploads and
+# images. Browsers reach it through the addon's gateway (s3_gateway.yml),
+# which also handles a fronting reverse proxy, so garage.ingress stays off.
+garage:
+  enabled: true
+  {{ img('garage') }}
+  persistence:
+    meta:
+      size: 1Gi
+      storageClassName: "{{ inv_k8s.storage_class.loc | default('local-path') }}"
+    data:
+      size: "{{ goat_addon.s3.pvc_size }}"
+      storageClassName: "{{ inv_k8s.storage_class.loc | default('local-path') }}"
+{% endif %}
 # STAC API + MCP server for the GOAT data catalog. Database-less: serves the
 # catalog mirror from the shared data volume. Offline, `sync_catalog` cannot
 # reach plan4better's catalog bucket, so the catalog stays empty (it answers
@@ -285,9 +320,9 @@ catalog:
   enabled: true
   {{ img('catalog') }}
   config:
-    ROOT_PATH: "/catalog"
+    ROOT_PATH: "/catalog-api"
 {% if has_ingress_ca %}  extraEnv:
-{{ ca_env() }}{% endif %}{{ ca_volumes() }}  {{ api_ingress('/catalog') }}
+{{ ca_env() }}{% endif %}{{ ca_volumes() }}  {{ api_ingress('/catalog-api') }}
 
 web:
   enabled: true
@@ -305,31 +340,21 @@ web:
   #
   # The others are string-concatenated with an explicit leading slash and
   # MUST NOT end in `/`. `catalog` is the STAC root; set it explicitly, the
-  # chart would derive `<host>/stac` without the /catalog prefix.
+  # chart would derive `<host>/stac` without the /catalog-api prefix.
   publicUrls:
     api: "{{ goat_public_url }}/core/"
     geoapi: "{{ goat_public_url }}/geoapi"
     processes: "{{ goat_public_url }}/processes"
-    catalog: "{{ goat_public_url }}/catalog/stac"
+    catalog: "{{ goat_public_url }}/catalog-api/stac"
   extraEnv:
     # NEXT_PUBLIC_APP_URL feeds NEXTAUTH_URL, which rejects a trailing `/`
     # (produces `//` in callbacks and 404s). MUST NOT end in `/`.
     - name: NEXT_PUBLIC_APP_URL
       value: "{{ goat_public_url }}"
-{% if has_ingress_ca %}    # NextAuth (server-side) calls Keycloak over HTTPS. Node needs
-    # the CA bundle on private-CA clusters.
-    - name: NODE_EXTRA_CA_CERTS
-      value: /etc/ssl/cacert/cacert.crt
-  extraVolumes:
-    - name: cacert
-      configMap:
-        name: cacert
-        optional: true
-  extraVolumeMounts:
-    - name: cacert
-      mountPath: /etc/ssl/cacert
-      readOnly: true
-{% endif %}  # goat-web at the host root. Next.js basePath is build-time and
+  # NextAuth (server-side) calls Keycloak over HTTPS. On private-CA clusters
+  # the chart sets NODE_EXTRA_CA_CERTS from global.caBundle.
+  #
+  # goat-web at the host root. Next.js basePath is build-time and
   # not set in this image's next.config.js. Serving under a subpath
   # would need an image fork.
   ingress:
@@ -372,8 +397,15 @@ postgresql:
     enabled: false       # civitas has Zalando cluster-wide
   cluster:
     enabled: false
+  # With db.pooler.enable, `host` is the pooler and GOAT prepares no
+  # statements on the server and sends no startup settings a stock pooler
+  # refuses (transactionPooler). DuckLake's catalog connections (geoapi,
+  # processes, their DuckLake init, the workers) use `ducklakeHost`, the
+  # database itself, on the same port.
   external:
-    host: "{{ goat_addon.db.host }}"
+    host: "{{ goat_db_app_host }}"
+    ducklakeHost: "{{ goat_db_ducklake_host }}"
+    transactionPooler: {{ goat_addon.db.pooler.enable | bool | lower }}
     port: {{ goat_addon.db.port }}
     database: "{{ goat_addon.db.goat_db_name }}"
     existingSecret: goat-postgres-creds
@@ -381,13 +413,15 @@ postgresql:
     existingSecretPasswordKey: password
     sslMode: prefer
 
+# geoapi's cache: the chart's own Deployment on the official Redis image. Its
+# password is generated on install and kept on upgrade by the chart.
 redis:
   enabled: true
-  # Bitnami's free images moved to `bitnamilegacy` in Aug 2025.
   image:
     registry: "{{ software.addon_goat.images.redis.registry }}"
     repository: "{{ software.addon_goat.images.redis.repository }}"
     tag: "{{ software.addon_goat.images.redis.tag }}"
+    pullPolicy: "{{ software.addon_goat.images.redis.pullPolicy | default('IfNotPresent') }}"
 
 # Windmill. Server and four workers (default, tools, workflows, print).
 # Bootstrap (workspace and API token) is a chart post-install hook.
@@ -416,19 +450,47 @@ windmill:
       repository: "{{ software.addon_goat.images.windmill_server.repository }}"
       tag: "{{ software.addon_goat.images.windmill_server.tag }}"
       pullPolicy: "{{ software.addon_goat.images.windmill_server.pullPolicy | default('Always') }}"
-    # No public ingress. processes reaches windmill via WINDMILL_URL
-    # in-cluster. BASE_URL points at the internal service so links
-    # windmill generates are at least resolvable from other pods.
+    # processes reaches windmill via WINDMILL_URL in-cluster. BASE_URL is the
+    # URL windmill builds its links and SSO callbacks from: the public host
+    # when windmill.ingress is on, else the internal service, so links are
+    # at least resolvable from other pods.
     config:
       MODE: "server"
-      BASE_URL: "http://goat-windmill-server"
-      DATABASE_CONNECTIONS: "5"
+      BASE_URL: "{{ goat_windmill_public_url if (goat_addon.windmill.ingress.enable | bool) else 'http://goat-windmill-server' }}"
+      # The server's own Postgres pool, on top of the few connections the
+      # server keeps outside it. 3 is the smallest pool it starts with, and
+      # each one less is a connection less on the shared central-db.
+      DATABASE_CONNECTIONS: "3"
+{% if goat_addon.windmill.ingress.enable | bool %}    # Own host: windmill cannot be served under a path prefix. The TLS
+    # Secret comes from the Certificate in certificate.yml.
     ingress:
+      enabled: true
+      className: "{{ inv_k8s.ingress_class }}"
+      annotations:
+{% if is_nginx %}        nginx.ingress.kubernetes.io/ssl-redirect: "{{ ssl_redirect }}"
+        nginx.ingress.kubernetes.io/whitelist-source-range: "{{ user_whitelist | default(['0.0.0.0/0']) | join(',') }}"
+{% else %}        {}
+{% endif %}      hosts:
+        - host: "{{ goat_windmill_ingress_host }}"
+          paths:
+            - path: /
+              pathType: Prefix
+      tls:
+        - secretName: "{{ goat_windmill_tls_secret }}"
+          hosts:
+            - "{{ goat_windmill_ingress_host }}"
+{% else %}    ingress:
       enabled: false
-  # Each goatlib-running worker needs the app DB, S3 and DuckLake
-  # config (the chart does not wire the workers). The chart's `data`
-  # volume is mounted on tools and workflows at /app/data.
-  # WHITELIST_ENVS exposes the variables to user scripts at runtime.
+{% endif %}
+  # The chart wires the print, tools and workflows workers for GOAT's jobs:
+  # the GOAT database (POSTGRES_*, from postgresql.external and
+  # goat-postgres-creds), DuckLake, PRINT_BASE_URL and the Keycloak client.
+  # It also builds WHITELIST_ENVS, the variables Windmill hands a job, from
+  # those plus every name in the worker's `config` and `extraEnv`. Do not set
+  # WHITELIST_ENVS here: it would replace the built list, and variables the
+  # chart adds later would never reach the jobs. S3 is set per worker below
+  # (the addon does not use the chart's global.s3). The shared data volume is
+  # mounted on tools and workflows at /app/data.
   workers:
     default:
       enabled: true
@@ -440,49 +502,43 @@ windmill:
       config:
         DATABASE_CONNECTIONS: "3"
         NUM_WORKERS: "1"
-{% for worker in ['tools', 'workflows'] %}
-    # `tools` and `workflows` share windmill-worker-tools (heavier,
+{% for worker in ['tools', 'workflows', 'print'] %}
+{% set img_key = 'windmill_worker_print' if worker == 'print' else 'windmill_worker_tools' %}
+{% if worker == 'print' %}    # Headless Chromium for PDFs and thumbnails. print_report.py uploads to S3
+    # and presigns a GET for the browser.
+{% else %}    # `tools` and `workflows` share windmill-worker-tools (heavier,
     # bundles goatlib and geospatial deps).
-    {{ worker }}:
+{% endif %}    {{ worker }}:
       enabled: true
       image:
-        registry: "{{ software.addon_goat.images.windmill_worker_tools.registry }}"
-        repository: "{{ software.addon_goat.images.windmill_worker_tools.repository }}"
-        tag: "{{ software.addon_goat.images.windmill_worker_tools.tag }}"
-        pullPolicy: "{{ software.addon_goat.images.windmill_worker_tools.pullPolicy | default('Always') }}"
-      # `null` (not `{}`) is required to actually drop the chart
+        registry: "{{ software.addon_goat.images[img_key].registry }}"
+        repository: "{{ software.addon_goat.images[img_key].repository }}"
+        tag: "{{ software.addon_goat.images[img_key].tag }}"
+        pullPolicy: "{{ software.addon_goat.images[img_key].pullPolicy | default('Always') }}"
+{% if worker == 'print' %}      nodeSelector: {}
+{% else %}      # `null` (not `{}`) is required to actually drop the chart
       # default `server-usage: geodata`. helm's coalesceTablesFullKey
       # merges chart keys into empty user maps, so `{}` re-inherits.
       nodeSelector: null
       tolerations: []
-      config:
-        MODE: "worker"
+{% endif %}      config:
+{% if worker != 'print' %}        MODE: "worker"
         WORKER_GROUP: "{{ worker }}"
         WORKER_TAGS: "{{ worker }}"
-        DATABASE_CONNECTIONS: "3"
+{% endif %}        DATABASE_CONNECTIONS: "3"
         NUM_WORKERS: "1"
-        WHITELIST_ENVS: "{{ worker_whitelist_envs }}"
-        POSTGRES_SERVER: "{{ goat_addon.db.host }}"
-        POSTGRES_PORT: "{{ goat_addon.db.port }}"
-        POSTGRES_DB: "{{ goat_addon.db.goat_db_name }}"
         S3_PROVIDER: "{{ s3_provider }}"
         S3_ENDPOINT_URL: "{{ s3_internal_endpoint }}"
         S3_PUBLIC_ENDPOINT_URL: "{{ s3_public_endpoint }}"
         S3_REGION: "{{ s3_region }}"
         S3_BUCKET_NAME: "{{ goat_addon.s3.bucket }}"
         S3_FORCE_PATH_STYLE: "true"
-        MAX_UPLOAD_DATASET_FILE_SIZE: "1073741824"
-        DUCKLAKE_CATALOG_SCHEMA: "ducklake"
-        DUCKLAKE_DATA_DIR: "/app/data/ducklake"
+{% if worker != 'print' %}        MAX_UPLOAD_DATASET_FILE_SIZE: "1073741824"
         DATA_DIR: "/app/data"
         CUSTOMER_SCHEMA: "customer"
-      extraEnv:
-        - name: POSTGRES_USER
-          valueFrom:
-            secretKeyRef: { name: goat-postgres-creds, key: username }
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef: { name: goat-postgres-creds, key: password }
+{% endif %}{% if worker == 'tools' and goat_addon.base_data.source_url | length > 0 %}        # Default source of the sync_base_data task (read from GOAT v3.0.5 on).
+        GOAT_BASE_DATA_URL: "{{ goat_addon.base_data.source_url }}"
+{% endif %}      extraEnv:
         - name: S3_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef: { name: goat-s3-credentials, key: access_key }
@@ -490,50 +546,10 @@ windmill:
           valueFrom:
             secretKeyRef: { name: goat-s3-credentials, key: secret_key }
 {% if has_s3_ca %}        - name: AWS_CA_BUNDLE
-          value: /etc/ssl/cacert/cacert.crt
+          value: "{{ chart_ca_path }}"
         - name: CURL_CA_BUNDLE
-          value: /etc/ssl/cacert/cacert.crt
-      extraVolumes:
-        - name: cacert
-          configMap:
-            name: cacert
-            optional: true
-      extraVolumeMounts:
-        - name: cacert
-          mountPath: /etc/ssl/cacert
-          readOnly: true
-{% endif %}
-{% endfor %}
-    print:
-      enabled: true
-      image:
-        registry: "{{ software.addon_goat.images.windmill_worker_print.registry }}"
-        repository: "{{ software.addon_goat.images.windmill_worker_print.repository }}"
-        tag: "{{ software.addon_goat.images.windmill_worker_print.tag }}"
-        pullPolicy: "{{ software.addon_goat.images.windmill_worker_print.pullPolicy | default('Always') }}"
-      nodeSelector: {}
-      config:
-        DATABASE_CONNECTIONS: "3"
-        NUM_WORKERS: "1"
-        # print_report.py uploads to S3 and presigns a GET for the
-        # browser; without these envs it falls through to an
-        # unauthenticated real-AWS client. WHITELIST_ENVS is required
-        # because Windmill filters the environment passed to job
-        # subprocesses — an unlisted var never reaches the tool.
-        WHITELIST_ENVS: "POSTGRES_SERVER,POSTGRES_PORT,POSTGRES_DB,POSTGRES_USER,POSTGRES_PASSWORD,S3_PROVIDER,S3_FORCE_PATH_STYLE,S3_ENDPOINT_URL,S3_PUBLIC_ENDPOINT_URL,S3_REGION,S3_BUCKET_NAME,S3_ACCESS_KEY_ID,S3_SECRET_ACCESS_KEY,MAX_UPLOAD_DATASET_FILE_SIZE,DUCKLAKE_CATALOG_SCHEMA,DUCKLAKE_DATA_DIR,CUSTOMER_SCHEMA,DUCKDB_EXTENSION_DIRECTORY"
-        S3_PROVIDER: "{{ s3_provider }}"
-        S3_ENDPOINT_URL: "{{ s3_internal_endpoint }}"
-        S3_PUBLIC_ENDPOINT_URL: "{{ s3_public_endpoint }}"
-        S3_REGION: "{{ s3_region }}"
-        S3_BUCKET_NAME: "{{ goat_addon.s3.bucket }}"
-        S3_FORCE_PATH_STYLE: "true"
-      extraEnv:
-        - name: S3_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef: { name: goat-s3-credentials, key: access_key }
-        - name: S3_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef: { name: goat-s3-credentials, key: secret_key }
+          value: "{{ chart_ca_path }}"
+{% endif %}{% endfor %}
 
 caddy:
   enabled: false         # goat-web owns its Ingress

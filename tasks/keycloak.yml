@@ -11,6 +11,7 @@
 # civitas 1.5 does not ship tasks/templates/keycloak_login.yaml. The
 # same flow is inlined here as in the airflow addon.
 - name: "GOAT addon: get platform admin credentials"
+  no_log: true
   kubernetes.core.k8s_info:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
@@ -20,12 +21,14 @@
   register: admin_credentials
 
 - name: "GOAT addon: store platform admin credentials"
+  no_log: true
   ansible.builtin.set_fact:
     ADMIN_USERNAME: "{{ admin_credentials.resources[0].data.MASTER_USERNAME | b64decode }}"
     ADMIN_PASSWORD: "{{ admin_credentials.resources[0].data.MASTER_PASSWORD | b64decode }}"
     cacheable: yes
 
 - name: "GOAT addon: login to civitas Keycloak as platform admin"
+  no_log: true
   check_mode: no
   uri:
     method: POST
@@ -180,6 +183,7 @@
         status_code: 204
 
 - name: "GOAT addon: fetch goat-web client secret"
+  no_log: true
   check_mode: no
   uri:
     method: GET
@@ -193,6 +197,7 @@
   register: keycloak_client_secret_response
 
 - name: "GOAT addon: extract Keycloak client secret"
+  no_log: true
   set_fact:
     client_secret: "{{ keycloak_client_secret_response.json.value }}"
 
@@ -201,6 +206,7 @@
 - name: "GOAT addon: generate or fetch a stable NEXTAUTH_SECRET"
   block:
     - name: "GOAT addon: check for existing goat-keycloak-creds"
+      no_log: true
       kubernetes.core.k8s_info:
         kubeconfig: "{{ k8s_config }}"
         context: "{{ k8s_context }}"
@@ -211,6 +217,7 @@
       register: existing_keycloak_secret
 
     - name: "GOAT addon: reuse existing NEXTAUTH_SECRET if available"
+      no_log: true
       ansible.builtin.set_fact:
         nextauth_secret: "{{ existing_keycloak_secret.resources[0].data['nextauth-secret'] | b64decode }}"
       when:
@@ -218,11 +225,13 @@
         - existing_keycloak_secret.resources[0].data['nextauth-secret'] is defined
 
     - name: "GOAT addon: generate a new NEXTAUTH_SECRET if none exists"
+      no_log: true
       ansible.builtin.set_fact:
         nextauth_secret: "{{ lookup('password', '/dev/null length=48 chars=ascii_letters,digits') }}"
       when: nextauth_secret is not defined
 
 - name: "GOAT addon: create or update goat-keycloak-creds K8s Secret"
+  no_log: true
   kubernetes.core.k8s:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"

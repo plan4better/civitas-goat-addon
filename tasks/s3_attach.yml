@@ -1,0 +1,194 @@
+---
+# Attach mode only (gated in tasks.yml).
+#
+# Preflight. Checks from inside the goat namespace,
+# with the client and settings GOAT itself uses (boto3, path-style, the
+# region, AWS_CA_BUNDLE), that the endpoint answers, the credentials are valid
+# and the bucket exists and may be listed. A wrong endpoint, key or bucket
+# fails the run here instead of at the first upload. Read-only: nothing is
+# written to the bucket.
+#
+# Runs the core image, which ships boto3 and is pulled for goat-core anyway.
+# The Job is recreated each run because Job specs are immutable.
+
+- name: GOAT addon clean up prior S3 preflight Job
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: goat-s3-preflight
+    namespace: "{{ goat_addon.namespace }}"
+    delete_options:
+      propagationPolicy: Foreground
+    wait: true
+
+- name: GOAT addon check the attached S3 bucket and credentials
+  vars:
+    goat_core_image: "{{ software.addon_goat.images.core }}"
+    goat_s3_preflight_env:
+      - name: S3_ENDPOINT_URL
+        value: "{{ goat_s3_endpoint }}"
+      - name: S3_BUCKET_NAME
+        value: "{{ goat_addon.s3.bucket }}"
+      - name: S3_REGION
+        value: "{{ goat_addon.s3.region }}"
+      - name: AWS_EC2_METADATA_DISABLED
+        value: "true"
+      - name: S3_ACCESS_KEY_ID
+        valueFrom:
+          secretKeyRef: { name: goat-s3-credentials, key: access_key }
+      - name: S3_SECRET_ACCESS_KEY
+        valueFrom:
+          secretKeyRef: { name: goat-s3-credentials, key: secret_key }
+    # The external S3 CA, as the services get it (cacert ConfigMap).
+    goat_s3_preflight_ca_env:
+      - name: AWS_CA_BUNDLE
+        value: /etc/ssl/cacert/cacert.crt
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: goat-s3-preflight
+        namespace: "{{ goat_addon.namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: civitas-goat-addon
+      spec:
+        backoffLimit: 0
+        # Includes pulling the core image on a fresh node.
+        activeDeadlineSeconds: 900
+        ttlSecondsAfterFinished: 3600
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/managed-by: civitas-goat-addon
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: preflight
+                image: "{{ goat_core_image.registry }}/{{ goat_core_image.repository }}:{{ goat_core_image.tag }}"
+                imagePullPolicy: "{{ goat_core_image.pullPolicy | default('IfNotPresent') }}"
+                command: ["python", "-c"]
+                args:
+                  - |
+                    import os, sys
+                    import boto3
+                    from botocore.config import Config
+                    from botocore.exceptions import BotoCoreError, ClientError, SSLError
+
+                    endpoint = os.environ["S3_ENDPOINT_URL"]
+                    bucket = os.environ["S3_BUCKET_NAME"]
+                    region = os.environ["S3_REGION"]
+                    hints = {
+                        "NoSuchBucket": "the bucket does not exist at this endpoint; create it first (inv_addons.goat.s3.bucket)",
+                        "InvalidAccessKeyId": "the access key is unknown to the endpoint (inv_addons.goat.s3.access_key)",
+                        "SignatureDoesNotMatch": "the secret key does not match the access key (inv_addons.goat.s3.secret_key)",
+                        "AccessDenied": ("the credentials may not list this bucket; they need s3:ListBucket, "
+                                         "s3:GetObject, s3:PutObject and s3:DeleteObject on it"),
+                        "AuthorizationHeaderMalformed": "the region does not match the endpoint (inv_addons.goat.s3.region)",
+                        "InvalidRegion": "the region does not match the endpoint (inv_addons.goat.s3.region)",
+                    }
+                    s3 = boto3.client(
+                        "s3",
+                        endpoint_url=endpoint,
+                        region_name=region,
+                        aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
+                        aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
+                        config=Config(
+                            s3={"addressing_style": "path"},
+                            connect_timeout=10,
+                            read_timeout=30,
+                            retries={"max_attempts": 2},
+                        ),
+                    )
+                    # A one-key listing rather than HeadBucket: its errors carry
+                    # a code (a HEAD answer has no body), and GOAT needs
+                    # s3:ListBucket anyway.
+                    try:
+                        s3.list_objects_v2(Bucket=bucket, MaxKeys=1)
+                    except ClientError as e:
+                        code = str(e.response.get("Error", {}).get("Code", ""))
+                        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                        print(f"S3 preflight FAILED on {endpoint}/{bucket}: {code} (HTTP {status}). "
+                              f"{hints.get(code, str(e))}")
+                        sys.exit(1)
+                    except BotoCoreError as e:
+                        hint = ("TLS failed: check the scheme of inv_addons.goat.s3.endpoint and, for a "
+                                "private CA, set inv_addons.goat.s3.customCACert to it" if isinstance(e, SSLError)
+                                else "the endpoint is not reachable from the goat namespace (inv_addons.goat.s3.endpoint, egress rules)")
+                        print(f"S3 preflight FAILED on {endpoint}/{bucket}: {e}. {hint}")
+                        sys.exit(1)
+                    print(f"S3 preflight OK: {endpoint}/{bucket} (region {region})")
+                env: "{{ goat_s3_preflight_env + (goat_s3_preflight_ca_env if (goat_addon.s3.customCACert | length > 0) else []) }}"
+                volumeMounts:
+                  - name: cacert
+                    mountPath: /etc/ssl/cacert
+                    readOnly: true
+            volumes:
+              - name: cacert
+                configMap:
+                  name: cacert
+                  optional: true
+
+# Polled rather than waited on with `wait_condition: Complete`, which would
+# sit out its timeout on a failed Job. Exhausted retries mark the task failed
+# whatever `failed_when` says, hence `ignore_errors`: the next task reports.
+- name: GOAT addon wait for the S3 preflight Job to finish
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: batch/v1
+    kind: Job
+    name: goat-s3-preflight
+    namespace: "{{ goat_addon.namespace }}"
+  register: goat_s3_preflight
+  retries: 95
+  delay: 10
+  until:
+    - goat_s3_preflight.resources | length > 0
+    - (goat_s3_preflight.resources[0].status.succeeded | default(0)) > 0
+      or (goat_s3_preflight.resources[0].status.failed | default(0)) > 0
+  failed_when: false
+  ignore_errors: true
+
+- name: GOAT addon read the S3 preflight output
+  kubernetes.core.k8s_log:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    namespace: "{{ goat_addon.namespace }}"
+    label_selectors:
+      - "job-name=goat-s3-preflight"
+  register: goat_s3_preflight_log
+  failed_when: false
+
+# Two kinds of failure: the check ran and failed (the script's "S3 preflight
+# FAILED" line says why: refused, unreachable, TLS), or it never got that far
+# (image pull, scheduling, a transient outage), which a re-run may fix.
+- name: GOAT addon fail early when the attached S3 is not usable
+  vars:
+    goat_s3_preflight_job: "{{ (goat_s3_preflight.resources | default([]) + [{}]) | first }}"
+    goat_s3_preflight_ok: "{{ (goat_s3_preflight_job.status.succeeded | default(0)) > 0 }}"
+    goat_s3_preflight_output: "{{ (goat_s3_preflight_log.log | default('')) | trim }}"
+    goat_s3_preflight_conditions: >-
+      {{ goat_s3_preflight_job.status.conditions | default([])
+         | map(attribute='reason') | select('defined') | join(', ') }}
+  ansible.builtin.fail:
+    msg: |-
+      {% if 'S3 preflight FAILED' in goat_s3_preflight_output %}
+      The attached S3 storage failed the check from namespace {{ goat_addon.namespace }}
+      (endpoint {{ goat_s3_endpoint }}, bucket {{ goat_addon.s3.bucket }}, region {{ goat_addon.s3.region }}):
+      {{ goat_s3_preflight_output }}
+      {% else %}
+      The S3 check did not complete within 15 minutes ({{ goat_s3_preflight_conditions or 'still running' }}).
+      This is not an answer from the storage: the core image may still be pulling, the pod may not
+      be scheduled, or the cluster or its registry had a transient outage. Check
+        kubectl -n {{ goat_addon.namespace }} describe job goat-s3-preflight
+      and run the addon again.
+      {% if goat_s3_preflight_output %}Output: {{ goat_s3_preflight_output }}{% endif %}
+      {% endif %}
+  when: not (goat_s3_preflight_ok | bool)

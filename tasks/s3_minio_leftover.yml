@@ -1,0 +1,27 @@
+---
+# The MinIO earlier addon versions deployed in provision mode. GOAT no longer
+# uses it, but its volume holds every upload made before the move to Garage
+# (or to an attached store), so the addon deletes nothing and says how to
+# copy the data and then remove it (README "Moving from MinIO").
+- name: GOAT addon look for the MinIO of an earlier addon version
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: minio-data
+    namespace: "{{ goat_addon.namespace }}"
+  register: goat_minio_leftover
+
+- name: GOAT addon report the MinIO left from an earlier addon version
+  ansible.builtin.debug:
+    msg: |-
+      Namespace {{ goat_addon.namespace }} still holds the MinIO of an earlier addon version and
+      its volume minio-data (uploads made before the move). GOAT no longer uses them, and the
+      addon deletes nothing. Its keys are in the Secret goat-minio-legacy-credentials
+      (goat-s3-credentials now holds the keys of {{ "the chart's Garage" if goat_addon.s3.mode == 'provision' else 'the attached store' }}).
+      Copy its buckets to {{ goat_s3_endpoint }} ({{ goat_addon.s3.bucket }}), then remove the MinIO,
+      see README "Moving from MinIO":
+        kubectl -n {{ goat_addon.namespace }} delete deployment/minio service/minio job/goat-bucket-init --ignore-not-found
+        kubectl -n {{ goat_addon.namespace }} delete pvc/minio-data secret/goat-minio-legacy-credentials
+  when: goat_minio_leftover.resources | length > 0

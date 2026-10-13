@@ -1,9 +1,11 @@
 ---
-# The shared data volume. Chart 0.5.x mounts it (`data.existingClaim` in
+# The shared data volume. The chart mounts it (`data.existingClaim` in
 # goat_values.yml) at /app/data on geoapi, processes, catalog, core and the
 # tools/workflows workers. It holds the DuckLake parquet -- every user layer
 # is stored here, not in S3 -- plus the catalog mirror and the routing base
-# data, so back it up and size it for the layer data.
+# data, so it is in the platform's volume backup (tasks/velero.yml with
+# civitas-core's Velero, README "Backup")
+# and size it for the layer data.
 #
 # The DuckLake catalog itself is created by the chart: an init container on
 # geoapi and processes runs goatlib's idempotent bootstrap from the same image

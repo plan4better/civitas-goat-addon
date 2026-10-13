@@ -4,6 +4,9 @@ addon_dir: "addons/goat_addon/"
 # Hoisted out of `goat_addon` to avoid a self-referential template loop
 # when a sibling key resolves this FQDN during rendering.
 goat_central_db_fqdn: "{{ (inv_addons.goat.db.central_db_name | default('central-db')) + '.' + inv_central_db.ns_name + '.svc.cluster.local' }}"
+# The connection pooler Zalando's operator runs for central-db once the CR has
+# `enableConnectionPooler: true` (db.yml sets it when db.pooler.enable is on).
+goat_central_db_pooler_fqdn: "{{ (inv_addons.goat.db.central_db_name | default('central-db')) + '-pooler.' + inv_central_db.ns_name + '.svc.cluster.local' }}"
 
 goat_addon:
   namespace: "{{ inv_addons.goat.namespace | default(ENVIRONMENT + '-goat-stack') }}"
@@ -35,6 +38,23 @@ goat_addon:
     # Per-service override for geoapi. Defaults to `host`/`port`.
     geoapi_host: "{{ inv_addons.goat.db.geoapi_host | default(inv_addons.goat.db.host | default(goat_central_db_fqdn)) }}"
     geoapi_port: "{{ inv_addons.goat.db.geoapi_port | default(inv_addons.goat.db.port | default(5432)) | int }}"
+    # True only when the inventory sets geoapi_host or geoapi_port. Otherwise
+    # geoapi takes the chart's connection like core and processes, pooler
+    # included.
+    geoapi_override: "{{ (inv_addons.goat.db.geoapi_host is defined) or (inv_addons.goat.db.geoapi_port is defined) }}"
+    # Transaction pooler for GOAT's own queries (core, geoapi, processes and
+    # the jobs). DuckLake's catalog connections stay on `host`, and Windmill
+    # on `windmill_host`: both hold sessions a transaction pooler breaks.
+    # The pooler must listen on `port`, which DuckLake shares (Zalando's does,
+    # on 5432). Off by default: GOAT does not need one, and civitas-core does
+    # not enable central-db's pooler. With it on, the chart's
+    # transactionPooler makes GOAT work with a stock PgBouncer (GOAT v3.0.9
+    # and later); preflight.yml asserts the rest.
+    pooler:
+      enable: "{{ inv_addons.goat.db.pooler.enable | default(false) | bool }}"
+      # A PgBouncer of your own. Empty = central-db's Zalando pooler, which
+      # the addon then enables on the CR (goat_db_pooler_*).
+      host: "{{ inv_addons.goat.db.pooler.host | default('') }}"
     # windmill role names (windmill_admin, windmill_user) are
     # hardcoded by its migrations regardless of db name, so two
     # installs sharing one cluster collide on roles.
@@ -42,6 +62,16 @@ goat_addon:
     windmill_db_name: "{{ inv_addons.goat.db.windmill_db_name | default('windmill') }}"
   keycloak:
     client_id: "{{ inv_addons.goat.keycloak.client_id | default('goat-web') }}"
+    # Keycloak clients whose tokens GOAT's APIs accept (chart
+    # global.auth.allowedClients, matched against the token's azp; GOAT
+    # v3.0.9 on). Default: GOAT's own client, so tokens other clients of the
+    # shared realm issue are refused. [] accepts every client.
+    allowed_clients: "{{ inv_addons.goat.keycloak.allowed_clients | default([inv_addons.goat.keycloak.client_id | default('goat-web')]) }}"
+    # Whether users may set up an organization of their own (chart
+    # global.auth.allowOrganizationCreation; GOAT v3.0.9 on). On for the
+    # first admin to create yours; set false afterwards, so users without an
+    # invitation wait for one instead (README "Organizations").
+    organization_creation: "{{ inv_addons.goat.keycloak.organization_creation | default(true) | bool }}"
     # Login gate. When true, only members of `gate_group` can log in to
     # GOAT. Everyone else is denied at authentication time. Off by
     # default. Standard Civitas deployments do not restrict GOAT access.
@@ -60,9 +90,10 @@ goat_addon:
     public_url: "{{ inv_addons.goat.web.public_url | default('https://' + (inv_addons.goat.web.subdomain | default('goat')) + '.' + DOMAIN) }}"
   s3:
     bucket: "{{ inv_addons.goat.s3.bucket | default('goat') }}"
-    # `provision` deploys a single-replica MinIO in-namespace (not HA).
-    # `attach` connects any S3-compatible endpoint and requires
-    # access_key, secret_key, region, and a pre-existing bucket.
+    # `provision` runs the chart's single-node Garage in-namespace
+    # (garage.enabled, not HA). `attach` connects any S3-compatible
+    # endpoint and requires access_key, secret_key, region, and a
+    # pre-existing bucket.
     mode: "{{ inv_addons.goat.s3.mode | default('provision') }}"
     # Cluster-internal endpoint (attach mode). The browser-facing
     # URL is always goat_public_url. The addon runs a `/<bucket>`
@@ -76,7 +107,10 @@ goat_addon:
     # inv_k8s.ingress.ca_path into the cacert ConfigMap and consumed
     # by every pod-side S3 client via AWS_CA_BUNDLE and CURL_CA_BUNDLE.
     customCACert: "{{ inv_addons.goat.s3.customCACert | default('') }}"
-    region: "{{ inv_addons.goat.s3.region | default('us-east-1') }}"
+    # Size of the provisioned Garage's data volume (uploads and images).
+    pvc_size: "{{ inv_addons.goat.s3.pvc_size | default('10Gi') }}"
+    # Garage signs requests for its own region only.
+    region: "{{ 'garage' if (inv_addons.goat.s3.mode | default('provision')) == 'provision' else (inv_addons.goat.s3.region | default('us-east-1')) }}"
     # Tunables for the `/<bucket>` passthrough Ingress (s3_gateway.yml).
     proxy:
       # ingress-nginx defaults to 1 MB, which 413s any real upload.
@@ -106,6 +140,19 @@ goat_addon:
     # Block-backed classes (Ceph RBD, EBS, GCE PD, Azure Disk) cannot
     # satisfy ReadWriteMany. The PVC then sits Pending forever.
     storage_class: "{{ inv_addons.goat.ducklake.storage_class | default(inv_k8s.storage_class.rwx) }}"
+  # Public Windmill UI on its own host (Windmill cannot run under a path
+  # prefix). Off by default: processes reaches Windmill in-cluster.
+  windmill:
+    ingress:
+      enable: "{{ inv_addons.goat.windmill.ingress.enable | default(false) | bool }}"
+      subdomain: "{{ inv_addons.goat.windmill.ingress.subdomain | default((inv_addons.goat.web.subdomain | default('goat')) + '-windmill') }}"
+      # Empty = https://<subdomain>.<DOMAIN> (goat_windmill_public_url).
+      public_url: "{{ inv_addons.goat.windmill.ingress.public_url | default('') }}"
+  # Routing and public transport base data (Windmill task sync_base_data).
+  base_data:
+    # GOAT_BASE_DATA_URL on the tools worker: the default source of
+    # sync_base_data. Empty = GOAT's public base data server.
+    source_url: "{{ inv_addons.goat.base_data.source_url | default('') }}"
   health_check:
     retries: 30
     delay_seconds: 10
@@ -123,14 +170,37 @@ goat_tls_secret: "{{ goat_ingress_host }}-tls"
 goat_public_url: "{{ goat_addon.web.public_url }}"
 goat_public_host: "{{ goat_public_url | regex_replace('^https?://', '') | regex_replace('/+$', '') }}"
 
+# Windmill's public host (windmill.ingress), same split as above.
+goat_windmill_ingress_host: "{{ goat_addon.windmill.ingress.subdomain + '.' + (INGRESS_DOMAIN | default(DOMAIN)) }}"
+goat_windmill_tls_secret: "{{ goat_windmill_ingress_host }}-tls"
+goat_windmill_public_url: >-
+  {{ (goat_addon.windmill.ingress.public_url or ('https://' + goat_addon.windmill.ingress.subdomain + '.' + DOMAIN))
+     | regex_replace('/+$', '') }}
+
+# Postgres hosts the chart gets. With the pooler on, `postgresql.external.host`
+# is the pooler and DuckLake keeps the database itself (`ducklakeHost`).
+
+goat_db_is_central: "{{ goat_addon.db.host == goat_central_db_fqdn }}"
+# The addon manages only central-db's own pooler, and only when no other
+# pooler host is named. preflight.yml rejects a pooler without a host for a
+# database other than central-db.
+goat_db_pooler_manage: "{{ (goat_addon.db.pooler.enable | bool) and goat_addon.db.pooler.host == '' and (goat_db_is_central | bool) }}"
+goat_db_pooler_host: "{{ goat_addon.db.pooler.host if goat_addon.db.pooler.host != '' else goat_central_db_pooler_fqdn }}"
+goat_db_app_host: "{{ goat_db_pooler_host if (goat_addon.db.pooler.enable | bool) else goat_addon.db.host }}"
+goat_db_ducklake_host: "{{ goat_addon.db.host if (goat_addon.db.pooler.enable | bool) else '' }}"
+
 # Path-style is structural — the addon fronts S3 at `/<bucket>` on the
 # public GOAT host; vhost addressing has no DNS or cert behind it. Both
 # terms are pinned because upstream's use_path_style() is
 # `force or provider == "minio"` (goatlib storage/s3_config.py:16), so
-# either being dropped still leaves path-style. `minio` names the
-# addressing class here, not the product — Dell ECS gets it too.
-goat_s3_provider: "minio"
+# either being dropped still leaves path-style. For an attached store
+# `minio` names the addressing class, not the product (Dell ECS gets it
+# too); the provisioned store is the chart's Garage.
+goat_s3_provider: "{{ 'garage' if goat_addon.s3.mode == 'provision' else 'minio' }}"
 goat_s3_url_style: "path"
+# Provision mode: the Garage bucket for uploaded images (core's assets),
+# public on the GOAT host at /<this bucket> (s3_gateway.yml).
+goat_s3_assets_bucket: "goat-assets"
 
 # Everything below derives from `goat_s3_endpoint`, the fact set by
 # s3_resolve.yml. Never from `goat_addon.s3.mode`, and never from the

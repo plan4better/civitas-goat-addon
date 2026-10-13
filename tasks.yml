@@ -11,6 +11,10 @@
       include_vars:
         dir: vars
 
+    # Inventory checks that need no cluster: chart version, pooler.
+    - name: "GOAT addon: preflight"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/preflight.yml"
+
     - name: "GOAT addon: create namespace and mirror the civitas CA"
       ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/namespace.yml"
 
@@ -26,17 +30,23 @@
     - name: "GOAT addon: resolve S3 endpoint and credentials"
       ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/s3_resolve.yml"
 
-    # `import_tasks` (not include) so the `addons` tag reaches the
-    # children. The `when:` copies onto every task in the file.
-    - name: "GOAT addon: provision in-cluster MinIO"
-      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/s3_provision.yml"
-      when: goat_addon.s3.mode == 'provision'
+    - name: "GOAT addon: report a MinIO left by an earlier addon version"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/s3_minio_leftover.yml"
+
+
+    # Fails the run here when the attached bucket or its credentials do not
+    # work, before anything else depends on them. `import_tasks` (not
+    # include) so the `addons` tag reaches the children; the `when:` copies
+    # onto every task in the file.
+    - name: "GOAT addon: check the attached S3 storage"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/s3_attach.yml"
+      when: goat_addon.s3.mode == 'attach'
 
     - name: "GOAT addon: publish the /<bucket> S3 gateway ingress"
       ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/s3_gateway.yml"
 
     # Last S3 consumer. The bootstrap Job needs the resolved endpoint,
-    # the credentials Secret and (in provision mode) the created bucket.
+    # the credentials Secret and (in attach mode) the checked bucket.
     - name: "GOAT addon: shared data volume"
       ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/ducklake.yml"
 
@@ -45,6 +55,10 @@
 
     - name: "GOAT addon: helm install"
       ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/helm_install.yml"
+
+    # With civitas-core's Velero on: GOAT's namespace in the nightly backup.
+    - name: "GOAT addon: Velero schedule"
+      ansible.builtin.import_tasks: "{{ addon_dir | default('') }}tasks/velero.yml"
 
     # Handled by the chart itself (no addon tasks).
     # windmill workspace, admin password and API token (post-install hook).

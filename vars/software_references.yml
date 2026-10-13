@@ -14,6 +14,9 @@
 # references it, and nesting the shared value in the same dict as its
 # consumers triggers `recursive loop detected in template string` when
 # the whole dict is templated (e.g. from an assert).
+# TODO(GOAT v3.0.9): move the default to "v3.0.9" once that release is tagged
+# (it is not yet). GOAT_BASE_DATA_URL is read from v3.0.5 on, and the
+# DuckLake bootstrap honours DUCKLAKE_POSTGRES_SERVER from v3.0.9 on.
 goat_release: "{{ inv_addons.goat.release | default('v3.0.3') }}"
 
 software:
@@ -21,6 +24,10 @@ software:
     helm_chart_name: goat
     helm_release_name: goat
     helm_repo_url: oci://ghcr.io/plan4better/charts
+    # TODO(chart 0.7.0): set to "0.7.0" once it is released (it is not yet).
+    # templates/goat_values.yml is written for 0.7.0 and does not install
+    # with 0.5.1: the Redis image below is the official one, which 0.5.1's
+    # Bitnami sub-chart cannot run.
     helm_chart_version: "0.5.1"
 
     # Chart-deployed images are consumed by the chart via
@@ -74,21 +81,17 @@ software:
         tag: "{{ goat_release }}"
         pullPolicy: IfNotPresent
 
-      # Free Bitnami images moved to bitnamilegacy in Aug 2025.
+      # geoapi's cache. The chart runs it as its own Deployment on the
+      # official image; same tag as the chart default.
       redis:
         registry: docker.io
-        repository: bitnamilegacy/redis
-        tag: "8.0.2"
+        repository: redis
+        tag: "7.4-alpine"
         pullPolicy: IfNotPresent
 
-      # Addon-deployed via s3_provision.yml, not via the chart.
-      minio:
-        registry: quay.io
-        repository: minio/minio
-        tag: RELEASE.2025-09-07T16-13-09Z
-        pullPolicy: IfNotPresent
-      minio_mc:
-        registry: quay.io
-        repository: minio/mc
-        tag: RELEASE.2025-08-13T08-35-41Z
+      # The chart's Garage (provision mode). Pinned like the compose bundle.
+      garage:
+        registry: docker.io
+        repository: dxflrs/garage
+        tag: v2.4.1
         pullPolicy: IfNotPresent
