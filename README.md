@@ -4,7 +4,7 @@
 
 ## Status
 
-Installs the GOAT Helm chart (`oci://ghcr.io/plan4better/charts/goat` v0.7.x, GOAT v3.0.3+) into civitas with:
+Installs the GOAT Helm chart (`oci://ghcr.io/plan4better/charts/goat` v0.7.x, GOAT v3.0.3+; values and version history in the [chart README](https://github.com/plan4better/goat/blob/main/deploy/helm/goat/README.md)) into civitas with:
 
 > **TODO (release):** `templates/goat_values.yml` is written for chart 0.7.0, which is not released yet. `vars/software_references.yml` still pins chart 0.5.1 and GOAT v3.0.3 (marked `TODO`); move both pins (chart `0.7.0`, GOAT `v3.0.9`) once they are released. The values do not install with chart 0.5.1, so until then a run with the default pin stops at the first task (`tasks/preflight.yml`), which refuses any chart older than 0.7.0; set `chart.version` (or `chart.ref` to a local 0.7.x archive) to run it.
 
@@ -179,7 +179,7 @@ Two override surfaces exist, with a firm boundary:
 - **First-class inventory key** (`inv_addons.goat.*`) — only for values the addon *tasks* consume: ingress hosts and TLS secrets, DB wiring, the S3 endpoint/ExternalName/annotations, Keycloak client. These values shape resources outside the Helm release, so they must flow through the addon's derivations.
 - **`inv_addons.goat.helm_values`** — pure chart tuning (replicas, resources, extra service env, …). Recursively merged over the rendered values file in `tasks/helm_install.yml`, so any chart key can be overridden without a fork.
 
-**Resources.** The addon sets no `resources`: every service runs with the chart's requests and limits (chart 0.7.0, "Resource defaults" in the chart README; memory limits as in GOAT's own production, e.g. core and web 1Gi, geoapi, processes, catalog, the print and the tools worker 4Gi, the Windmill server 2Gi). Override them in `helm_values`, and set requests and limits together: Helm merges maps, so a limit set alone keeps the chart's request (and a request above its limit fails the upgrade). `resources: null` drops a service's defaults. geoapi's DuckDB budgets (`GEOAPI_DUCKLAKE_POOL_SIZE`, `GEOAPI_DUCKDB_MEMORY_LIMIT`, set by the chart) must fit its limit; raise them together.
+**Resources.** The addon sets no `resources`: every service runs with the chart's requests and limits (chart 0.7.0, "Resource defaults" in the [chart README](https://github.com/plan4better/goat/blob/main/deploy/helm/goat/README.md); memory limits as in GOAT's own production, e.g. core and web 1Gi, geoapi, processes, catalog, the print and the tools worker 4Gi, the Windmill server 2Gi). Override them in `helm_values`, and set requests and limits together: Helm merges maps, so a limit set alone keeps the chart's request (and a request above its limit fails the upgrade). `resources: null` drops a service's defaults. geoapi's DuckDB budgets (`GEOAPI_DUCKLAKE_POOL_SIZE`, `GEOAPI_DUCKDB_MEMORY_LIMIT`, set by the chart) must fit its limit; raise them together.
 
 ```yaml
 inv_addons:
