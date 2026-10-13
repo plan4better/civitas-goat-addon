@@ -1,0 +1,35 @@
+---
+# Registers GOAT's namespace with civitas-core's Velero
+# (inv_op_stack.velero), as civitas-core's own components do: when the
+# platform runs Velero, a nightly Schedule backs up the namespace with its
+# volumes: goat-ducklake-data (every user layer) and, in provision mode,
+# Garage's goat-garage-meta and goat-garage-data (uploads and images). The
+# volumes go through Velero's file-system backup (the node agent
+# civitas-core deploys), which copies only what changed since the last run.
+# Backup location, retention and restore stay with the platform.
+#
+# 02:00 UTC is after central-db's logical backup (Postgres operator default
+# 00:30 UTC), so the DuckLake catalog is backed up before its files, and
+# after GOAT's DuckLake maintenance and compaction (00:00 to 01:00 UTC),
+# which delete and rewrite files.
+- name: GOAT addon Velero schedule for GOAT's namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: velero.io/v1
+      kind: Schedule
+      metadata:
+        name: "{{ goat_addon.namespace }}-backup"
+        namespace: "{{ inv_op_stack.velero.ns_name }}"
+      spec:
+        schedule: "0 2 * * *"
+        template:
+          includedNamespaces:
+            - "{{ goat_addon.namespace }}"
+          defaultVolumesToFsBackup: true
+          snapshotVolumes: false
+          storageLocation: "{{ inv_op_stack.velero.backup.location_name }}-backup"
+          ttl: 720h0m0s
+  when: ((inv_op_stack | default({})).velero | default({})).enable | default(false) | bool

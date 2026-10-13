@@ -1,0 +1,74 @@
+---
+# Checks that need no cluster access, before the addon changes anything.
+
+# templates/goat_values.yml is written for chart 0.7.0: with an older chart
+# the workers lose their database and DuckLake settings (and WHITELIST_ENVS),
+# and Redis would run the official image on the old Bitnami sub-chart. An
+# OCI reference installs `chart.version`; a local archive or directory says
+# its own version in Chart.yaml.
+- name: GOAT addon read the version of a local chart
+  ansible.builtin.command:
+    argv: [helm, show, chart, "{{ goat_addon.chart.ref }}"]
+  register: goat_chart_meta
+  changed_when: false
+  check_mode: false
+  when: goat_addon.chart.ref is not match('oci://')
+
+- name: GOAT addon preflight chart version
+  vars:
+    goat_chart_version: >-
+      {{ goat_addon.chart.version if (goat_addon.chart.ref is match('oci://'))
+         else (goat_chart_meta.stdout | from_yaml).version }}
+  ansible.builtin.assert:
+    that:
+      - goat_chart_version is version('0.7.0', '>=')
+    fail_msg: >-
+      This addon version needs GOAT chart 0.7.0 or later, but the run would
+      install chart {{ goat_chart_version }} from {{ goat_addon.chart.ref }}.
+      Set inv_addons.goat.chart.version (or chart.ref to a local 0.7.x
+      archive), or leave both unset for the pin in
+      vars/software_references.yml.
+    quiet: true
+
+- name: GOAT addon preflight connection pooler host
+  ansible.builtin.assert:
+    that:
+      - (goat_db_is_central | bool) or goat_addon.db.pooler.host != ''
+    fail_msg: >-
+      db.pooler.enable is on and db.host ({{ goat_addon.db.host }}) is not
+      central-db. Set inv_addons.goat.db.pooler.host to the pooler in front of
+      that database; the addon only manages central-db's own pooler.
+    quiet: true
+  when: goat_addon.db.pooler.enable | bool
+
+# POSTGRES_TRANSACTION_POOLER (the chart's transactionPooler), which lets
+# GOAT run behind a stock PgBouncer, exists from GOAT v3.0.9 on; older images
+# ignore it and fail behind the pooler. A release that isn't a plain vX.Y.Z
+# tag (a commit, an rc) is the operator's call.
+- name: GOAT addon preflight connection pooler GOAT version
+  ansible.builtin.assert:
+    that:
+      - goat_release is not match('^v[0-9]+[.][0-9]+[.][0-9]+$') or (goat_release[1:] is version('3.0.9', '>='))
+    fail_msg: >-
+      db.pooler.enable needs GOAT v3.0.9 or later (POSTGRES_TRANSACTION_POOLER);
+      this run would install {{ goat_release }}. Set inv_addons.goat.release,
+      or leave the pooler off: GOAT does not need one.
+    quiet: true
+  when: goat_addon.db.pooler.enable | bool
+
+# core refuses to start when the allow-list leaves out its own client: the
+# web app signs users in with it, and the services pass those tokens on.
+- name: GOAT addon preflight allowed Keycloak clients
+  ansible.builtin.assert:
+    that:
+      - goat_addon.keycloak.allowed_clients is iterable
+      - goat_addon.keycloak.allowed_clients is not string
+      - goat_addon.keycloak.allowed_clients | length == 0
+        or goat_addon.keycloak.client_id in goat_addon.keycloak.allowed_clients
+    fail_msg: >-
+      inv_addons.goat.keycloak.allowed_clients
+      ({{ goat_addon.keycloak.allowed_clients }}) must be a list that
+      includes GOAT's own client, keycloak.client_id
+      ({{ goat_addon.keycloak.client_id }}), or be empty to accept every
+      client of the realm.
+    quiet: true

@@ -5,12 +5,12 @@ inv_addons:
   goat:
     enable: true
     # One pin for every plan4better/goat image.
-    release: "v3.0.3"
+    release: "v3.0.9"
     web:
       subdomain: "goat"
       # public_url: "https://goat.{{ DOMAIN }}"
     s3:
-      # `provision` deploys a single-replica MinIO in-cluster.
+      # `provision` runs the chart's single-node Garage in-cluster.
       # `attach` uses an existing S3-compatible endpoint (set endpoint and credentials).
       mode: "provision"
       endpoint: ""
@@ -27,7 +27,7 @@ inv_addons:
     # chart:                        # OCI pull from ghcr.io by default. Override
     #                               # ref to a local tgz for offline installs.
     #   ref: "oci://ghcr.io/plan4better/charts/goat"
-    #   version: "0.5.1"
+    #   version: "0.7.0"
     # db:
     #   goat_db_name: "goat"
     #   windmill_db_name: "windmill"
@@ -40,10 +40,20 @@ inv_addons:
     #   windmill_port: 5432
     #   geoapi_host: "central-db.<inv_central_db.ns_name>.svc.cluster.local"
     #   geoapi_port: 5432
+    #   # GOAT's queries through a PgBouncer; DuckLake and Windmill stay on
+    #   # the database. Not needed; GOAT v3.0.9 or later. Your own (host) or
+    #   # central-db's. README §Connection pooler.
+    #   pooler:
+    #     enable: false
+    #     host: ""
     # keycloak:
     #   client_id: "goat-web"
     #   # Login gate. Only members of the gate group can log in.
     #   # See README §Restricting login. Default off.
+    #   # Clients whose tokens GOAT accepts; default: client_id only.
+    #   allowed_clients: ["goat-web"]
+    #   # Set false once your organization exists (README "Organizations").
+    #   organization_creation: true
     #   limit_access: false
     #   gate_role: "goat-user"
     #   gate_group: "goat-users"
@@ -53,3 +63,11 @@ inv_addons:
     #   pvc_size: "20Gi"
     #   pvc_access_mode: "ReadWriteOnce"
     #   storage_class: "nfs-client"
+    # windmill:
+    #   # Public Windmill UI on its own host. See README §Windmill UI.
+    #   ingress:
+    #     enable: false
+    #     subdomain: "goat-windmill"
+    # base_data:
+    #   # Default source of sync_base_data (GOAT_BASE_DATA_URL), e.g. a mirror.
+    #   source_url: ""

@@ -9,30 +9,9 @@
 # installs) pins itself, so it goes through the wrapper's local-chart branch
 # with no version. `helm_repo_name` stays unset either way.
 
-# Bitnami's bundled redis auto-generates a password on first install
-# and stores it in `goat-redis`. Subsequent `helm upgrade` runs refuse
-# to render unless `global.redis.password` is supplied. The task reads
-# it back and threads it through. Empty on first install (Bitnami
-# generates the password itself).
-- name: GOAT addon fetch existing redis password, populated after first install
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ k8s_config }}"
-    context: "{{ k8s_context }}"
-    api_version: v1
-    kind: Secret
-    namespace: "{{ goat_addon.namespace }}"
-    name: goat-redis
-  register: existing_redis_secret
-
-- name: GOAT addon thread existing redis password into helm values on upgrade
-  ansible.builtin.set_fact:
-    redis_password_override:
-      global:
-        redis:
-          password: "{{ existing_redis_secret.resources[0].data['redis-password'] | b64decode }}"
-  when:
-    - existing_redis_secret.resources | length > 0
-    - existing_redis_secret.resources[0].data['redis-password'] is defined
+# The chart keeps the Redis password itself: it generates `goat-redis` on
+# install and reads it back on every upgrade (the module runs helm with
+# cluster access).
 
 - name: Helm create the GOAT installation (OCI chart, pinned version)
   ansible.builtin.include_tasks: tasks/templates/k8s-helm.yml
@@ -43,7 +22,7 @@
     helm_chart_reference: "{{ goat_addon.chart.ref }}"
     helm_chart_version: "{{ goat_addon.chart.version }}"
     helm_values_file: "{{ addon_dir | default('') }}templates/goat_values.yml"
-    helm_values_rcombine: "{{ (inv_addons.goat.helm_values | default({})) | combine(redis_password_override | default({}), recursive=True) }}"
+    helm_values_rcombine: "{{ inv_addons.goat.helm_values | default({}) }}"
     helm_create_namespace: false
 
 - name: Helm create the GOAT installation (local chart archive)
@@ -54,5 +33,5 @@
     helm_release_name: "{{ software.addon_goat.helm_release_name }}"
     helm_chart_reference: "{{ goat_addon.chart.ref }}"
     helm_values_file: "{{ addon_dir | default('') }}templates/goat_values.yml"
-    helm_values_rcombine: "{{ (inv_addons.goat.helm_values | default({})) | combine(redis_password_override | default({}), recursive=True) }}"
+    helm_values_rcombine: "{{ inv_addons.goat.helm_values | default({}) }}"
     helm_create_namespace: false

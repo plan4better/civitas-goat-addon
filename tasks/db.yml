@@ -67,7 +67,45 @@
       spec:
         preparedDatabases: "{{ goat_prepared_db_patch }}"
 
+# Opt-in (db.pooler.enable without db.pooler.host). Zalando's operator then
+# runs PgBouncer as the Deployment and Service `<cluster>-pooler` next to the
+# cluster, in the pooling mode of its operator config (civitas-core:
+# transaction), with its stock image; the chart's transactionPooler makes
+# GOAT work with it (README §Connection pooler). Switching db.pooler.enable
+# off again does not remove the pooler: other components may use it by then.
+- name: Enable the connection pooler on civitas central-db
+  kubernetes.core.k8s:
+    state: patched
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    definition:
+      apiVersion: acid.zalan.do/v1
+      kind: postgresql
+      metadata:
+        name: "{{ goat_addon.db.central_db_name }}"
+      spec:
+        enableConnectionPooler: true
+  when: goat_db_pooler_manage | bool
+
+- name: Wait for the central-db pooler to be available
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ k8s_config }}"
+    context: "{{ k8s_context }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ goat_addon.db.central_db_ns }}"
+    name: "{{ goat_addon.db.central_db_name }}-pooler"
+  register: goat_db_pooler
+  retries: 30
+  delay: 10
+  until:
+    - goat_db_pooler.resources | length > 0
+    - (goat_db_pooler.resources[0].status.availableReplicas | default(0)) >= 1
+  when: goat_db_pooler_manage | bool
+
 - name: Wait for goat owner-user secret to be created by postgres-operator
+  no_log: true
   kubernetes.core.k8s_info:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
@@ -81,6 +119,7 @@
   until: goat_db_secret.resources | length > 0
 
 - name: Wait for windmill owner-user secret to be created by postgres-operator
+  no_log: true
   kubernetes.core.k8s_info:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
@@ -94,6 +133,7 @@
   until: windmill_db_secret.resources | length > 0
 
 - name: Copy DB owner-user secrets into the goat namespace
+  no_log: true
   kubernetes.core.k8s:
     state: present
     kubeconfig: "{{ k8s_config }}"

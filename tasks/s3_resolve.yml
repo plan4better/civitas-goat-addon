@@ -1,8 +1,8 @@
 ---
 # S3 resolution layer. `goat_addon.s3.mode` decides what backs the
 # stack's object storage.
-# `provision` deploys a single-replica MinIO via s3_provision.yml
-# (mirrors plan4better's compose topology, not HA).
+# `provision` uses the GOAT chart's single-node Garage (garage.enabled,
+# not HA), as GOAT's compose bundle does.
 # `attach` uses a pre-existing S3-compatible endpoint. The addon
 # creates nothing inside the S3 system.
 # Mode picks the endpoint and the credential source here. Every
@@ -45,10 +45,13 @@
     goat_s3_endpoint: >-
       {{ (goat_addon.s3.endpoint
           if goat_addon.s3.mode == 'attach'
-          else 'http://minio.' + goat_addon.namespace + '.svc.cluster.local:9000')
+          else 'http://goat-garage.' + goat_addon.namespace + '.svc.cluster.local:3900')
          | trim | regex_replace('/+$', '') }}
 
-# provision mode reuses existing credentials on rerun if the Secret is present.
+# provision mode reuses existing credentials on rerun if the Secret holds a
+# key pair in Garage's format (key id GK + 24 hex digits, secret 64 hex
+# digits); keys from an earlier addon's MinIO are replaced. Both modes keep
+# the keys of such a MinIO for it (below).
 - name: GOAT addon check for existing goat-s3-credentials secret
   kubernetes.core.k8s_info:
     kubeconfig: "{{ k8s_config }}"
@@ -58,9 +61,10 @@
     name: goat-s3-credentials
     namespace: "{{ goat_addon.namespace }}"
   register: goat_s3_existing_secret
-  when: goat_addon.s3.mode == 'provision'
+  no_log: true
 
 - name: GOAT addon resolve S3 credentials
+  no_log: true
   block:
     - name: GOAT addon use attach-mode S3 credentials from inventory
       ansible.builtin.set_fact:
@@ -68,23 +72,111 @@
         goat_s3_secret_key: "{{ goat_addon.s3.secret_key }}"
       when: goat_addon.s3.mode == 'attach'
 
-    - name: GOAT addon reuse existing S3 credentials
+    - name: GOAT addon reuse existing Garage S3 credentials
       ansible.builtin.set_fact:
         goat_s3_access_key: "{{ goat_s3_existing_secret.resources[0].data.access_key | b64decode }}"
         goat_s3_secret_key: "{{ goat_s3_existing_secret.resources[0].data.secret_key | b64decode }}"
       when:
         - goat_addon.s3.mode == 'provision'
         - goat_s3_existing_secret.resources | length > 0
+        - goat_s3_existing_secret.resources[0].data.access_key | b64decode is match('^GK[0-9a-f]{24}$')
 
-    - name: GOAT addon generate new S3 credentials
+    - name: GOAT addon generate new Garage S3 credentials
       ansible.builtin.set_fact:
-        goat_s3_access_key: "goat-{{ lookup('community.general.random_string', length=12, special=false) | lower }}"
-        goat_s3_secret_key: "{{ lookup('community.general.random_string', length=40, special=false) }}"
+        goat_s3_access_key: "GK{{ lookup('community.general.random_string', length=24, override_all='0123456789abcdef') }}"
+        goat_s3_secret_key: "{{ lookup('community.general.random_string', length=64, override_all='0123456789abcdef') }}"
       when:
         - goat_addon.s3.mode == 'provision'
-        - goat_s3_existing_secret.resources | length == 0
+        - goat_s3_access_key is not defined
+
+# goat-s3-credentials held the root keys of the MinIO that earlier addon
+# versions deployed in provision mode (its Deployment reads them from there).
+# Before this run writes other keys into it (Garage's, or an attached
+# store's), it copies the MinIO keys to goat-minio-legacy-credentials and
+# points that MinIO at the copy, so the MinIO keeps its keys across restarts
+# and its data can still be copied out (README "Moving from MinIO").
+# Nothing is deleted.
+- name: GOAT addon keep the keys of an earlier provision-mode MinIO
+  block:
+    - name: GOAT addon look for a provision-mode MinIO
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_config }}"
+        context: "{{ k8s_context }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: minio
+        namespace: "{{ goat_addon.namespace }}"
+      register: goat_minio_deployment
+
+    - name: GOAT addon look for kept MinIO keys
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ k8s_config }}"
+        context: "{{ k8s_context }}"
+        api_version: v1
+        kind: Secret
+        name: goat-minio-legacy-credentials
+        namespace: "{{ goat_addon.namespace }}"
+      register: goat_minio_legacy_secret
+      no_log: true
+
+    # Only while goat-s3-credentials still holds the MinIO's keys, i.e. not
+    # yet the attached store's.
+    - name: GOAT addon copy the MinIO keys to goat-minio-legacy-credentials
+      kubernetes.core.k8s:
+        kubeconfig: "{{ k8s_config }}"
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: goat-minio-legacy-credentials
+            namespace: "{{ goat_addon.namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: civitas-goat-addon
+          type: Opaque
+          data:
+            access_key: "{{ goat_s3_existing_secret.resources[0].data.access_key }}"
+            secret_key: "{{ goat_s3_existing_secret.resources[0].data.secret_key }}"
+      no_log: true
+      when:
+        - goat_minio_deployment.resources | length > 0
+        - goat_minio_legacy_secret.resources | length == 0
+        - goat_s3_existing_secret.resources | length > 0
+        - (goat_s3_existing_secret.resources[0].data.access_key | b64decode) != goat_s3_access_key
+
+    # Strategic merge on the env list (merged by name): only the two keys'
+    # source changes. Rolls the MinIO pod once, onto the same keys.
+    - name: GOAT addon point the provision-mode MinIO at its kept keys
+      kubernetes.core.k8s:
+        kubeconfig: "{{ k8s_config }}"
+        context: "{{ k8s_context }}"
+        state: patched
+        api_version: apps/v1
+        kind: Deployment
+        name: minio
+        namespace: "{{ goat_addon.namespace }}"
+        definition:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: minio
+                    env:
+                      - name: MINIO_ROOT_USER
+                        valueFrom:
+                          secretKeyRef: { name: goat-minio-legacy-credentials, key: access_key }
+                      - name: MINIO_ROOT_PASSWORD
+                        valueFrom:
+                          secretKeyRef: { name: goat-minio-legacy-credentials, key: secret_key }
+      when:
+        - goat_minio_deployment.resources | length > 0
+        - (goat_minio_legacy_secret.resources | length > 0)
+          or ((goat_s3_existing_secret.resources | length > 0)
+              and (goat_s3_existing_secret.resources[0].data.access_key | b64decode) != goat_s3_access_key)
 
 - name: GOAT addon persist S3 credentials secret
+  no_log: true
   kubernetes.core.k8s:
     kubeconfig: "{{ k8s_config }}"
     context: "{{ k8s_context }}"
